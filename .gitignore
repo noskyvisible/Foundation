@@ -1,0 +1,8 @@
+# CMake build output (everything regenerable lives here)
+/build/
+
+# Local editor / agent settings
+/.claude/
+
+# ImGui layout file (we disable persistence, but just in case)
+imgui.ini
