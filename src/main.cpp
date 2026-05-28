@@ -39,6 +39,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 // ---- Shaders -------------------------------------------------------------
@@ -87,15 +88,49 @@ in vec2 vUv;
 uniform vec3 uColor;
 uniform sampler2D uAlbedo;
 uniform int uHasTexture;
+uniform vec3 uLightDir;     // direction TO the sun (normalized)
+uniform vec3 uLightColor;   // sun colour * intensity (dims at night)
+uniform vec3 uAmbient;      // sky ambient (dim blue at night, never black)
 out vec4 FragColor;
 void main() {
     vec3 n = normalize(vNormal);
-    vec3 L = normalize(vec3(0.4, 1.0, 0.6));   // fixed directional light
-    float diff = max(dot(n, L), 0.0);
-    float ambient = 0.28;
+    float diff = max(dot(n, normalize(uLightDir)), 0.0);
     vec3 base = uColor;
     if (uHasTexture == 1) base *= texture(uAlbedo, vUv).rgb;
-    FragColor = vec4(base * (ambient + (1.0 - ambient) * diff), 1.0);
+    FragColor = vec4(base * (uAmbient + uLightColor * diff), 1.0);
+}
+)glsl";
+
+// Procedural sky: a fullscreen triangle (no VBO) shaded by view direction.
+static const char* kSkyVS = R"glsl(
+#version 330 core
+out vec2 vNdc;
+void main() {
+    vec2 p = vec2(float((gl_VertexID & 1) << 2) - 1.0, float((gl_VertexID & 2) << 1) - 1.0);
+    vNdc = p;
+    gl_Position = vec4(p, 1.0, 1.0);
+}
+)glsl";
+
+static const char* kSkyFS = R"glsl(
+#version 330 core
+in vec2 vNdc;
+uniform mat4 uInvViewProj;
+uniform vec3 uCamPos;
+uniform vec3 uSunDir;       // direction TO the sun
+uniform vec3 uHorizon;
+uniform vec3 uZenith;
+uniform vec3 uSunColor;
+out vec4 FragColor;
+void main() {
+    vec4 far = uInvViewProj * vec4(vNdc, 1.0, 1.0);
+    vec3 dir = normalize(far.xyz / far.w - uCamPos);
+    float up = clamp(dir.y, 0.0, 1.0);
+    vec3 col = mix(uHorizon, uZenith, pow(up, 0.45));
+    float s = max(dot(dir, normalize(uSunDir)), 0.0);
+    col += uSunColor * pow(s, 350.0);          // sun disc
+    col += uSunColor * 0.25 * pow(s, 6.0);     // glow
+    FragColor = vec4(col, 1.0);
 }
 )glsl";
 
@@ -297,6 +332,56 @@ static bool loadModel(const std::string& path, MeshAsset& out) {
     return !out.subs.empty();
 }
 
+// ---- Environment: game clock + day/night sky + sun-driven light ----------
+struct Environment {
+    // Authored / controllable state.
+    float timeOfDay   = 9.0f;     // hours, 0-24
+    int   day         = 1;
+    float dayLengthSec = 600.0f;  // real seconds for a full 24h game day
+    bool  running     = true;
+    // Derived each frame from timeOfDay.
+    glm::vec3 sunDir     {0, 1, 0};   // direction TO the sun
+    glm::vec3 sunColor   {1.0f};
+    glm::vec3 horizonColor{0.7f, 0.8f, 0.95f};
+    glm::vec3 zenithColor {0.3f, 0.55f, 0.9f};
+    glm::vec3 lightColor {1.0f};      // directional light colour (0 at night)
+    glm::vec3 ambient    {0.3f};      // sky ambient colour (dim blue at night)
+};
+
+// `advance` should be true only in play mode; the editor freezes the clock
+// (you scrub the time slider to preview). The sky/light are recomputed from
+// timeOfDay regardless, so scrubbing updates the view.
+static void updateEnvironment(Environment& e, float dt, bool advance) {
+    if (advance && e.running && e.dayLengthSec > 0.0f) {
+        e.timeOfDay += dt * (24.0f / e.dayLengthSec);
+        while (e.timeOfDay >= 24.0f) { e.timeOfDay -= 24.0f; ++e.day; }
+        while (e.timeOfDay < 0.0f)   { e.timeOfDay += 24.0f; --e.day; }
+    }
+
+    const float PI = 3.14159265f;
+    float a = (e.timeOfDay - 6.0f) / 12.0f * PI;   // 0 at 06:00, PI at 18:00
+    float elev = std::sin(a);                       // sun elevation, <0 at night
+    e.sunDir = glm::normalize(glm::vec3(std::cos(a), elev, 0.35f));
+
+    float dayAmt = glm::clamp((elev + 0.05f) / 0.30f, 0.0f, 1.0f);  // 0 night -> 1 day
+    float duskAmt = (elev > 0.0f && elev < 0.30f) ? (1.0f - elev / 0.30f) : 0.0f;
+
+    glm::vec3 dayZenith (0.20f, 0.45f, 0.85f), dayHorizon(0.70f, 0.82f, 0.95f);
+    glm::vec3 nightZenith(0.02f, 0.03f, 0.07f), nightHorizon(0.05f, 0.06f, 0.12f);
+    glm::vec3 dusk(0.95f, 0.45f, 0.18f);
+
+    e.zenithColor  = glm::mix(nightZenith,  dayZenith,  dayAmt);
+    e.horizonColor = glm::mix(nightHorizon, dayHorizon, dayAmt) + dusk * duskAmt * 0.8f;
+    e.sunColor     = glm::mix(glm::vec3(1.0f, 0.55f, 0.25f), glm::vec3(1.0f, 0.97f, 0.9f),
+                              glm::clamp(elev / 0.4f, 0.0f, 1.0f));
+    e.lightColor   = e.sunColor * dayAmt;
+    // Night keeps a dim blue ambient so the world stays visible (Skyrim-style),
+    // rising to a neutral grey during the day.
+    glm::vec3 nightAmbient(0.16f, 0.18f, 0.27f);
+    glm::vec3 dayAmbient(0.30f, 0.30f, 0.30f);
+    e.ambient      = glm::mix(nightAmbient, dayAmbient, dayAmt);
+}
+
 // ---- Offscreen render target (one per viewport, later) -------------------
 struct RenderTarget {
     GLuint fbo = 0;
@@ -454,8 +539,11 @@ struct GPUMesh    { std::vector<GPUSubMesh> subs; AABB bounds; };
 struct Renderer {
     GLuint lineProgram = 0;            // grid + selection box (pos+colour, uMVP)
     GLint  lineMvpLoc = -1;
-    GLuint litProgram = 0;             // objects (pos+normal+uv, uMVP+uModel+uColor+albedo)
+    GLuint litProgram = 0;             // objects (pos+normal+uv, lit)
     GLint  litMvpLoc = -1, litModelLoc = -1, litColorLoc = -1, litHasTexLoc = -1, litAlbedoLoc = -1;
+    GLint  litLightDirLoc = -1, litLightColLoc = -1, litAmbientLoc = -1;
+    GLuint skyProgram = 0, skyVao = 0; // procedural sky (fullscreen triangle)
+    GLint  skyInvVPLoc = -1, skyCamLoc = -1, skySunLoc = -1, skyHorizonLoc = -1, skyZenithLoc = -1, skySunColLoc = -1;
     GLuint gridVao = 0, gridVbo = 0;   // pos+colour
     GLuint selBoxVao = 0, selBoxVbo = 0;
     int    gridVertexCount = 0;
@@ -519,6 +607,19 @@ static Renderer createRenderer() {
     r.litColorLoc = glGetUniformLocation(r.litProgram, "uColor");
     r.litHasTexLoc = glGetUniformLocation(r.litProgram, "uHasTexture");
     r.litAlbedoLoc = glGetUniformLocation(r.litProgram, "uAlbedo");
+    r.litLightDirLoc = glGetUniformLocation(r.litProgram, "uLightDir");
+    r.litLightColLoc = glGetUniformLocation(r.litProgram, "uLightColor");
+    r.litAmbientLoc  = glGetUniformLocation(r.litProgram, "uAmbient");
+
+    r.skyProgram   = createProgram(kSkyVS, kSkyFS);
+    r.skyInvVPLoc  = glGetUniformLocation(r.skyProgram, "uInvViewProj");
+    r.skyCamLoc    = glGetUniformLocation(r.skyProgram, "uCamPos");
+    r.skySunLoc    = glGetUniformLocation(r.skyProgram, "uSunDir");
+    r.skyHorizonLoc= glGetUniformLocation(r.skyProgram, "uHorizon");
+    r.skyZenithLoc = glGetUniformLocation(r.skyProgram, "uZenith");
+    r.skySunColLoc = glGetUniformLocation(r.skyProgram, "uSunColor");
+    glGenVertexArrays(1, &r.skyVao);   // empty VAO for the no-VBO fullscreen triangle
+
     makeGrid(r.gridVao, r.gridVbo, r.gridVertexCount);
     makeSelectionBox(r.selBoxVao, r.selBoxVbo, r.selBoxVertexCount);
     return r;
@@ -534,10 +635,12 @@ static void destroyRenderer(Renderer& r) {
         }
     glDeleteVertexArrays(1, &r.gridVao);
     glDeleteVertexArrays(1, &r.selBoxVao);
+    glDeleteVertexArrays(1, &r.skyVao);
     glDeleteBuffers(1, &r.gridVbo);
     glDeleteBuffers(1, &r.selBoxVbo);
     glDeleteProgram(r.lineProgram);
     glDeleteProgram(r.litProgram);
+    glDeleteProgram(r.skyProgram);
     r = Renderer{};
 }
 
@@ -547,7 +650,8 @@ static void destroyRenderer(Renderer& r) {
 // meshes must already be synced to the library (see syncMeshes).
 static void renderScene(GLuint fbo, int width, int height, const Camera& cam,
                         const glm::mat4& view, const glm::mat4& proj, const Renderer& r,
-                        bool wireframe3D, bool showGrid, const std::vector<glm::mat4>& models,
+                        const Environment& env, bool wireframe3D, bool showGrid,
+                        const std::vector<glm::mat4>& models,
                         const std::vector<glm::vec3>& colors, const std::vector<int>& meshIds,
                         int selectedIndex = -1, float gridSpacing = kGridStep) {
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
@@ -556,6 +660,23 @@ static void renderScene(GLuint fbo, int width, int height, const Camera& cam,
     if (cam.type == Projection::Ortho) glClearColor(0.06f, 0.06f, 0.07f, 1.0f);
     else                               glClearColor(0.11f, 0.11f, 0.13f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    // Procedural sky behind everything (perspective views only).
+    if (cam.type == Projection::Perspective && r.skyProgram) {
+        glDepthMask(GL_FALSE);
+        glDisable(GL_DEPTH_TEST);
+        glUseProgram(r.skyProgram);
+        glUniformMatrix4fv(r.skyInvVPLoc, 1, GL_FALSE, glm::value_ptr(glm::inverse(proj * view)));
+        glUniform3fv(r.skyCamLoc, 1, glm::value_ptr(cam.eye));
+        glUniform3fv(r.skySunLoc, 1, glm::value_ptr(env.sunDir));
+        glUniform3fv(r.skyHorizonLoc, 1, glm::value_ptr(env.horizonColor));
+        glUniform3fv(r.skyZenithLoc, 1, glm::value_ptr(env.zenithColor));
+        glUniform3fv(r.skySunColLoc, 1, glm::value_ptr(env.sunColor));
+        glBindVertexArray(r.skyVao);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glEnable(GL_DEPTH_TEST);
+        glDepthMask(GL_TRUE);
+    }
 
     // Grid (unlit lines), oriented into this view's plane and scaled to the
     // requested grid size.
@@ -574,6 +695,9 @@ static void renderScene(GLuint fbo, int width, int height, const Camera& cam,
     glPolygonMode(GL_FRONT_AND_BACK, wire ? GL_LINE : GL_FILL);
     glUseProgram(r.litProgram);
     glUniform1i(r.litAlbedoLoc, 0);   // albedo sampler -> texture unit 0
+    glUniform3fv(r.litLightDirLoc, 1, glm::value_ptr(env.sunDir));
+    glUniform3fv(r.litLightColLoc, 1, glm::value_ptr(env.lightColor));
+    glUniform3fv(r.litAmbientLoc, 1, glm::value_ptr(env.ambient));
     for (size_t i = 0; i < models.size(); ++i) {
         int mid = i < meshIds.size() ? meshIds[i] : 0;
         if (mid < 0 || mid >= (int)r.meshes.size()) continue;
@@ -583,8 +707,10 @@ static void renderScene(GLuint fbo, int width, int height, const Camera& cam,
         for (const GPUSubMesh& s : r.meshes[mid].subs) {
             glm::vec3 c = s.baseColor * tint;
             glUniform3fv(r.litColorLoc, 1, glm::value_ptr(c));
-            glUniform1i(r.litHasTexLoc, s.tex ? 1 : 0);
-            if (s.tex) { glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, s.tex); }
+            // Skip the texture in wireframe so the lines are plain, not textured.
+            bool useTex = !wire && s.tex;
+            glUniform1i(r.litHasTexLoc, useTex ? 1 : 0);
+            if (useTex) { glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, s.tex); }
             glBindVertexArray(s.vao);
             glDrawElements(GL_TRIANGLES, s.count, GL_UNSIGNED_INT, 0);
         }
@@ -633,11 +759,42 @@ static float rayAabbT(glm::vec3 ro, glm::vec3 rd, const glm::mat4& model,
 }
 
 // A scene object: a named transform + colour (tint) + which mesh asset it uses.
+// npcTemplate >= 0 marks this object as a placed NPC instance of that template.
 struct SceneObject {
     std::string name;
     glm::mat4 transform{1.0f};
     glm::vec3 color{0.75f, 0.75f, 0.8f};
-    int meshId = 0;   // index into the mesh library (0 = built-in cube)
+    int meshId = 0;        // index into the mesh library (0 = built-in cube)
+    int npcTemplate = -1;  // index into npcTemplates, or -1 if a plain object
+};
+
+// ---- NPC definition (template) -------------------------------------------
+// One schedule entry: at `hour` the NPC goes to `location` (a scene object's
+// name) and performs `activity`. Used by the simulation layer (later).
+struct ScheduleEntry {
+    float       hour = 8.0f;       // 0-24
+    std::string activity = "work";
+    std::string location = "";     // name of a scene object to go to
+};
+
+// Curated survival/RPG stats. Needs are 0-100 and deplete at a per-game-hour
+// rate; the simulation will refill them by eating/drinking/resting.
+struct NPCAttributes {
+    float health = 100.0f;
+    float hunger = 100.0f, hungerRate = 4.0f;
+    float thirst = 100.0f, thirstRate = 6.0f;
+    float energy = 100.0f, energyRate = 4.0f;
+    int   gold = 50;
+    float moveSpeed = 1.5f;        // world units / second
+};
+
+// A reusable NPC type: mesh + attributes + custom fields + a daily schedule.
+struct NPCTemplate {
+    std::string name = "NPC";
+    int meshId = 0;                // which mesh asset this NPC uses
+    NPCAttributes attr;
+    std::vector<std::pair<std::string, float>> custom;  // user-defined attributes
+    std::vector<ScheduleEntry> schedule;
 };
 
 // Plain-text scene format: a header + count, then per object a name line and a
@@ -702,7 +859,7 @@ struct EditContext {
 // `edit` is supplied, draws a gizmo for the selected object and handles
 // click-to-select. Returns true if the viewport image was hovered this frame.
 static bool drawViewportPanel(const char* name, RenderTarget& rt, const Camera& cam,
-                              const Renderer& r, bool wireframe3D, bool showGrid,
+                              const Renderer& r, const Environment& env, bool wireframe3D, bool showGrid,
                               const std::vector<glm::mat4>& models, const std::vector<glm::vec3>& colors,
                               const std::vector<int>& meshIds,
                               int selectedIndex, float gridSpacing, EditContext* edit = nullptr) {
@@ -719,7 +876,7 @@ static bool drawViewportPanel(const char* name, RenderTarget& rt, const Camera& 
         glm::mat4 proj = projMatrix(cam, aspect);
 
         resizeTarget(rt, w, h);
-        renderScene(rt.fbo, rt.width, rt.height, cam, view, proj, r, wireframe3D, showGrid, models, colors, meshIds, selectedIndex, gridSpacing);
+        renderScene(rt.fbo, rt.width, rt.height, cam, view, proj, r, env, wireframe3D, showGrid, models, colors, meshIds, selectedIndex, gridSpacing);
         // Flip V (uv 0,1 -> 1,0): GL textures have origin at bottom-left.
         ImGui::Image((ImTextureID)(intptr_t)rt.color, avail, ImVec2(0, 1), ImVec2(1, 0));
         imageHovered = ImGui::IsItemHovered();
@@ -834,13 +991,20 @@ int main() {
     bool  snapEnabled = false;  // snap gizmo drags to the grid
     float gridSize    = 1.0f;   // grid spacing AND translate snap increment
 
+    Environment env;            // game clock + day/night sky + sun light
+
     // Mesh library: asset #0 is the built-in cube; loaded models append. Each
     // Renderer uploads these into its own GL context lazily (syncMeshes).
     std::vector<MeshAsset> meshLibrary;
     meshLibrary.push_back(buildCubeMesh());
 
+    // NPC templates (reusable types). Instances are SceneObjects whose
+    // npcTemplate indexes into this list.
+    std::vector<NPCTemplate> npcTemplates;
+    int selectedTemplate = -1;
+
     // The scene is a list of objects referencing mesh assets. The gizmo edits
-    // the selected object's transform; cubeAngle (play sim) spins each on top.
+    // the selected object's transform.
     std::vector<SceneObject> scene;
     {
         // Start by loading models/testModel.glb (try a few cwd-relative paths).
@@ -875,12 +1039,9 @@ int main() {
     std::string sceneStatus;       // last save/load result, shown in Outliner
 
     // Play-mode state. Play opens a SEPARATE OS window with its own GL context
-    // running the game; the editor stays static. cubeAngle is simulation state,
-    // advanced only while playing; Stop closes the window and resets the pose.
+    // running the game; the editor stays static.
     GLFWwindow* playWindow   = nullptr;
     Renderer    playRenderer{};
-    bool        playing      = false;
-    float       cubeAngle    = 0.0f;   // radians; scene state, not wall-clock time
     bool        prevF5       = false;  // edge-detect the F5 toggle (editor window)
     bool        prevPlayF11  = false;  // edge-detect F11 (play window fullscreen)
     bool        playFullscreen = false;
@@ -907,8 +1068,6 @@ int main() {
         playRenderer = createRenderer();
         glfwMakeContextCurrent(window);   // restore editor context
         playFullscreen = false;
-        playing   = true;
-        cubeAngle = 0.0f;
     };
     auto closePlay = [&]() {
         glfwMakeContextCurrent(playWindow);
@@ -916,8 +1075,6 @@ int main() {
         glfwMakeContextCurrent(window);
         glfwDestroyWindow(playWindow);
         playWindow = nullptr;
-        playing    = false;
-        cubeAngle  = 0.0f;
     };
 
     // Four viewports: a perspective 3/4 view plus three orthographic views
@@ -978,7 +1135,9 @@ int main() {
         ImGuiID outlinerId = ImGui::DockBuilderSplitNode(leftId, ImGuiDir_Up, 0.4f, nullptr, &controlsId);
         ImGui::DockBuilderDockWindow("Outliner", outlinerId);
         ImGui::DockBuilderDockWindow("Controls", controlsId);
+        ImGui::DockBuilderDockWindow("Environment", controlsId);   // tabbed with Controls
         ImGui::DockBuilderDockWindow("Properties", rightId);
+        ImGui::DockBuilderDockWindow("NPC Editor", rightId);   // tabbed with Properties
         if (layoutSingle) {
             ImGui::DockBuilderDockWindow(viewName[activeView], mainId);
         } else {
@@ -1028,6 +1187,53 @@ int main() {
         scene.push_back(o);
         selected = (int)scene.size() - 1;
     };
+    auto doAddCube = [&]() {
+        snapshot();
+        static const glm::vec3 palette[6] = {
+            {0.85f,0.35f,0.35f}, {0.4f,0.7f,0.4f}, {0.4f,0.55f,0.9f},
+            {0.9f,0.8f,0.35f},   {0.7f,0.45f,0.85f}, {0.4f,0.8f,0.8f},
+        };
+        SceneObject o;
+        o.name = "Cube " + std::to_string(scene.size());
+        o.transform = glm::translate(glm::mat4(1.0f), glm::vec3((float)scene.size() * 1.5f, 0.0f, 0.0f));
+        o.color = palette[scene.size() % 6];
+        scene.push_back(o);
+        selected = (int)scene.size() - 1;
+    };
+    auto doDelete = [&]() {
+        if (selected < 0 || selected >= (int)scene.size()) return;
+        snapshot();
+        scene.erase(scene.begin() + selected);
+        if (selected >= (int)scene.size()) selected = (int)scene.size() - 1;
+    };
+    auto doSave = [&]() {
+        sceneStatus = saveScene(scene, kScenePath) ? "Saved scene.fdn" : "Save FAILED";
+    };
+    auto doLoad = [&]() {
+        std::vector<SceneObject> loaded;
+        if (loadScene(loaded, kScenePath)) {
+            snapshot();
+            scene = std::move(loaded);
+            selected = scene.empty() ? -1 : 0;
+            sceneStatus = "Loaded scene.fdn";
+        } else sceneStatus = "Load FAILED (no scene.fdn?)";
+    };
+    auto doLoadMesh = [&]() {
+        std::string path = openModelFileDialog("models");
+        if (path.empty()) return;
+        MeshAsset asset;
+        if (loadModel(path, asset)) {
+            snapshot();
+            meshLibrary.push_back(std::move(asset));
+            SceneObject o;
+            o.name   = meshLibrary.back().name;
+            o.meshId = (int)meshLibrary.size() - 1;
+            o.color  = glm::vec3(1.0f);
+            scene.push_back(o);
+            selected = (int)scene.size() - 1;
+            sceneStatus = "Loaded " + o.name;
+        } else sceneStatus = "Mesh load FAILED";
+    };
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -1042,11 +1248,11 @@ int main() {
         if (f5 && !prevF5) { if (playWindow) closePlay(); else openPlay(); }
         prevF5 = f5;
 
-        // Frame timing + simulation tick: only advance scene state while playing.
+        // Frame timing.
         double now = glfwGetTime();
         float  dt  = (float)(now - lastTime);
         lastTime   = now;
-        if (playing) cubeAngle += dt * 1.0f;   // ~1 rad/sec
+        updateEnvironment(env, dt, playWindow != nullptr);   // clock ticks only in play mode
 
         // ---- Editor render (editor GL context) ----
         glfwMakeContextCurrent(window);
@@ -1069,8 +1275,7 @@ int main() {
             if (ImGui::IsKeyPressed(ImGuiKey_Y, false)) doRedo();
             if (ImGui::IsKeyPressed(ImGuiKey_C, false)) doCopy();
             if (ImGui::IsKeyPressed(ImGuiKey_V, false)) doPaste();
-            if (ImGui::IsKeyPressed(ImGuiKey_S, false))
-                sceneStatus = saveScene(scene, kScenePath) ? "Saved scene.fdn" : "Save FAILED";
+            if (ImGui::IsKeyPressed(ImGuiKey_S, false)) doSave();
         }
 
         // Derive the perspective camera's eye/target from its fly state.
@@ -1079,6 +1284,57 @@ int main() {
             camPersp.eye = camPersp.flyPos;
             camPersp.target = camPersp.flyPos + f;
             camPersp.up = glm::vec3(0, 1, 0);
+        }
+
+        // ---- Top menu bar ----
+        if (ImGui::BeginMainMenuBar()) {
+            if (ImGui::BeginMenu("File")) {
+                if (ImGui::MenuItem("Save", "Ctrl+S"))            doSave();
+                if (ImGui::MenuItem("Load"))                      doLoad();
+                if (ImGui::MenuItem("Load Mesh (GLB/FBX)..."))    doLoadMesh();
+                ImGui::Separator();
+                if (ImGui::MenuItem("Exit"))                      glfwSetWindowShouldClose(window, true);
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Edit")) {
+                if (ImGui::MenuItem("Undo", "Ctrl+Z", false, !undoStack.empty())) doUndo();
+                if (ImGui::MenuItem("Redo", "Ctrl+Y", false, !redoStack.empty())) doRedo();
+                ImGui::Separator();
+                bool hasSel = selected >= 0 && selected < (int)scene.size();
+                if (ImGui::MenuItem("Copy",   "Ctrl+C", false, hasSel))        doCopy();
+                if (ImGui::MenuItem("Paste",  "Ctrl+V", false, hasClipboard))  doPaste();
+                if (ImGui::MenuItem("Delete", nullptr,  false, hasSel))        doDelete();
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Create")) {
+                if (ImGui::MenuItem("Cube"))                   doAddCube();
+                if (ImGui::MenuItem("Mesh (GLB/FBX)..."))      doLoadMesh();
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Layout")) {
+                if (ImGui::MenuItem("Quad view", "Space", !layoutSingle)) { layoutSingle = false; layoutDirty = true; }
+                ImGui::Separator();
+                for (int i = 0; i < 4; ++i)
+                    if (ImGui::MenuItem(viewName[i], nullptr, layoutSingle && activeView == i))
+                        { activeView = i; layoutSingle = true; layoutDirty = true; }
+                ImGui::Separator();
+                ImGui::MenuItem("Show grid",         nullptr, &showGrid);
+                ImGui::MenuItem("Wireframe 3D view", nullptr, &wireframe3D);
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Play")) {
+                if (ImGui::MenuItem(playWindow ? "Stop" : "Play", "F5")) { if (playWindow) closePlay(); else openPlay(); }
+                ImGui::EndMenu();
+            }
+            // Right-aligned clock + mode indicator.
+            int hh = (int)env.timeOfDay;
+            int mm = (int)((env.timeOfDay - hh) * 60.0f);
+            ImGui::SameLine(ImGui::GetWindowWidth() - 230.0f);
+            ImGui::Text("Day %d  %02d:%02d", env.day, hh, mm);
+            ImGui::SameLine();
+            ImGui::TextColored(playWindow ? ImVec4(0.4f, 0.9f, 0.4f, 1.0f) : ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
+                               playWindow ? "  PLAYING" : "  EDIT");
+            ImGui::EndMainMenuBar();
         }
 
         // Full-window dockspace so panels can be docked/tabbed/resized.
@@ -1119,10 +1375,10 @@ int main() {
         int hoveredView = -1;
         auto drawView = [&](int i) -> bool {
             switch (i) {
-                case 0: return drawViewportPanel("Perspective", rtPersp, camPersp, renderer, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize, &edit);
-                case 1: return drawViewportPanel("Top",   rtTop,   camTop,   renderer, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize);
-                case 2: return drawViewportPanel("Front", rtFront, camFront, renderer, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize);
-                default:return drawViewportPanel("Right", rtRight, camRight, renderer, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize);
+                case 0: return drawViewportPanel("Perspective", rtPersp, camPersp, renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize, &edit);
+                case 1: return drawViewportPanel("Top",   rtTop,   camTop,   renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize);
+                case 2: return drawViewportPanel("Front", rtFront, camFront, renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize);
+                default:return drawViewportPanel("Right", rtRight, camRight, renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize);
             }
         };
         if (layoutSingle) {
@@ -1190,107 +1446,59 @@ int main() {
 
         // --- Outliner: scene object list + add/delete ---
         ImGui::Begin("Outliner");
-        if (ImGui::Button("Add Cube")) {
-            snapshot();
-            static const glm::vec3 palette[6] = {
-                {0.85f,0.35f,0.35f}, {0.4f,0.7f,0.4f}, {0.4f,0.55f,0.9f},
-                {0.9f,0.8f,0.35f},   {0.7f,0.45f,0.85f}, {0.4f,0.8f,0.8f},
-            };
-            float x = (float)scene.size() * 1.5f;   // stagger so they don't overlap
-            SceneObject o;
-            o.name = "Cube " + std::to_string(scene.size());
-            o.transform = glm::translate(glm::mat4(1.0f), glm::vec3(x, 0.0f, 0.0f));
-            o.color = palette[scene.size() % 6];
-            scene.push_back(o);
-            selected = (int)scene.size() - 1;
-        }
+        if (ImGui::Button("Add Cube"))   doAddCube();
         ImGui::SameLine();
-        if (ImGui::Button("Delete") && selected >= 0 && selected < (int)scene.size()) {
-            snapshot();
-            scene.erase(scene.begin() + selected);
-            if (selected >= (int)scene.size()) selected = (int)scene.size() - 1;
-        }
-        if (ImGui::Button("Load Mesh (GLB/FBX)")) {
-            std::string path = openModelFileDialog("models");
-            if (!path.empty()) {
-                MeshAsset asset;
-                if (loadModel(path, asset)) {
-                    snapshot();
-                    meshLibrary.push_back(std::move(asset));
-                    SceneObject o;
-                    o.name   = meshLibrary.back().name;     // its filename
-                    o.meshId = (int)meshLibrary.size() - 1;
-                    o.color  = glm::vec3(1.0f);             // white tint -> material colours show
-                    o.transform = glm::mat4(1.0f);          // origin
-                    scene.push_back(o);
-                    selected = (int)scene.size() - 1;
-                    sceneStatus = "Loaded " + o.name;
-                } else {
-                    sceneStatus = "Mesh load FAILED";
-                }
-            }
-        }
-        if (ImGui::Button("Save (Ctrl+S)"))
-            sceneStatus = saveScene(scene, kScenePath) ? "Saved scene.fdn" : "Save FAILED";
-        ImGui::SameLine();
-        if (ImGui::Button("Load")) {
-            std::vector<SceneObject> loaded;
-            if (loadScene(loaded, kScenePath)) {
-                snapshot();
-                scene = std::move(loaded);
-                selected = scene.empty() ? -1 : 0;
-                sceneStatus = "Loaded scene.fdn";
-            } else {
-                sceneStatus = "Load FAILED (no scene.fdn?)";
-            }
-        }
-        if (!sceneStatus.empty()) ImGui::TextUnformatted(sceneStatus.c_str());
+        ImGui::BeginDisabled(selected < 0 || selected >= (int)scene.size());
+        if (ImGui::Button("Delete"))     doDelete();
+        ImGui::EndDisabled();
         ImGui::Separator();
         for (int i = 0; i < (int)scene.size(); ++i) {
             if (ImGui::Selectable(scene[i].name.c_str(), selected == i))
                 selected = i;
         }
+        if (!sceneStatus.empty()) {
+            ImGui::Separator();
+            ImGui::TextWrapped("%s", sceneStatus.c_str());
+        }
         ImGui::End();
 
-        // --- Controls / stats panel ---
+        // --- Controls: tools + display settings + help ---
         ImGui::Begin("Controls");
-        ImGui::TextUnformatted(playWindow ? "Mode: PLAYING" : "Mode: EDIT");
-        if (ImGui::Button(playWindow ? "Stop (F5)" : "Play (F5)")) {
-            if (playWindow) closePlay(); else openPlay();
-        }
-        ImGui::Separator();
-        ImGui::TextUnformatted("Layout");
-        if (ImGui::Button(layoutSingle ? "Quad view (Space)" : "Maximize (Space)")) {
-            layoutSingle = !layoutSingle;
-            layoutDirty = true;
-        }
-        for (int i = 0; i < 4; ++i) {
-            bool isActive = layoutSingle && activeView == i;
-            if (ImGui::RadioButton(viewName[i], isActive)) {
-                activeView = i; layoutSingle = true; layoutDirty = true;
-            }
-        }
-        ImGui::Separator();
-        ImGui::TextUnformatted("Gizmo (click cube to select)");
+        ImGui::SeparatorText("Gizmo");
         if (ImGui::RadioButton("Move (W)",   gizmoOp == ImGuizmo::TRANSLATE)) gizmoOp = ImGuizmo::TRANSLATE;
         if (ImGui::RadioButton("Rotate (E)", gizmoOp == ImGuizmo::ROTATE))    gizmoOp = ImGuizmo::ROTATE;
         if (ImGui::RadioButton("Scale (R)",  gizmoOp == ImGuizmo::SCALE))     gizmoOp = ImGuizmo::SCALE;
         bool worldMode = (gizmoMode == ImGuizmo::WORLD);
         if (ImGui::Checkbox("World space", &worldMode))
             gizmoMode = worldMode ? ImGuizmo::WORLD : ImGuizmo::LOCAL;
-        ImGui::Separator();
+
+        ImGui::SeparatorText("Grid");
         ImGui::Checkbox("Show grid", &showGrid);
         ImGui::Checkbox("Snap to grid", &snapEnabled);
         ImGui::SetNextItemWidth(90.0f);
         if (ImGui::DragFloat("Grid size", &gridSize, 0.05f, 0.05f, 16.0f, "%.2f"))
             gridSize = glm::clamp(gridSize, 0.05f, 16.0f);
-        ImGui::Checkbox("Wireframe 3D view", &wireframe3D);
+
+        ImGui::SeparatorText("Stats");
+        ImGui::Text("%.1f FPS  (%.2f ms)", io.Framerate, 1000.0f / io.Framerate);
+
+        ImGui::SeparatorText("Help");
+        ImGui::TextWrapped("Wheel zooms the hovered view. In Perspective hold RIGHT mouse to fly (WASD, E/Q up/down, wheel = speed). Space maximizes the hovered view.");
+        ImGui::End();
+
+        // --- Environment: time of day + day/night ---
+        ImGui::Begin("Environment");
+        int hh = (int)env.timeOfDay;
+        int mm = (int)((env.timeOfDay - hh) * 60.0f);
+        ImGui::Text("Day %d   %02d:%02d", env.day, hh, mm);
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::SliderFloat("##time", &env.timeOfDay, 0.0f, 24.0f, "%.2f h");
+        ImGui::Checkbox("Clock runs in Play", &env.running);
+        ImGui::SetNextItemWidth(120.0f);
+        ImGui::SliderFloat("Day length (s)", &env.dayLengthSec, 10.0f, 3600.0f, "%.0f");
+        ImGui::TextDisabled("Real seconds per full 24h day.");
         ImGui::Separator();
-        ImGui::Text("%.1f FPS  (%.2f ms/frame)", io.Framerate, 1000.0f / io.Framerate);
-        ImGui::Separator();
-        ImGui::TextWrapped("Edit: Ctrl+Z undo, Ctrl+Y redo, Ctrl+C copy, Ctrl+V paste selected.");
-        ImGui::TextWrapped("Navigation: mouse wheel zooms the hovered view. In Perspective, hold RIGHT mouse to fly: WASD move, E/Q up/down, wheel = speed.");
-        ImGui::TextWrapped("Play (F5) opens a separate game window (F11 fullscreen, Esc stop). The editor stays static.");
+        ImGui::TextWrapped("Time only advances in Play mode (F5). In the editor, drag the time slider to preview the sky. NPC schedules use this clock.");
         ImGui::End();
 
         // --- Properties: inspector for the selected object (right side) ---
@@ -1320,10 +1528,118 @@ int main() {
             propActivated |= ImGui::IsItemActivated();
             ImGui::TextDisabled("Texture: drop files in materials/ (coming soon)");
 
+            if (o.npcTemplate >= 0 && o.npcTemplate < (int)npcTemplates.size()) {
+                ImGui::SeparatorText("NPC");
+                ImGui::Text("Template: %s", npcTemplates[o.npcTemplate].name.c_str());
+                ImGui::TextDisabled("Edit the type in the NPC Editor tab.");
+            }
+
             if (propActivated) snapshot();
         } else {
             ImGui::TextDisabled("No object selected.");
             ImGui::TextWrapped("Click an object in a viewport or the Outliner to edit it here.");
+        }
+        ImGui::End();
+
+        // --- NPC Editor: author reusable NPC templates ---
+        ImGui::Begin("NPC Editor");
+        if (ImGui::Button("New Template")) {
+            NPCTemplate t;
+            t.name = "NPC " + std::to_string(npcTemplates.size());
+            npcTemplates.push_back(t);
+            selectedTemplate = (int)npcTemplates.size() - 1;
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(selectedTemplate < 0 || selectedTemplate >= (int)npcTemplates.size());
+        if (ImGui::Button("Delete Template")) {
+            npcTemplates.erase(npcTemplates.begin() + selectedTemplate);
+            for (SceneObject& so : scene) {     // keep instance links valid
+                if (so.npcTemplate == selectedTemplate)      so.npcTemplate = -1;
+                else if (so.npcTemplate > selectedTemplate)  so.npcTemplate--;
+            }
+            if (selectedTemplate >= (int)npcTemplates.size()) selectedTemplate = (int)npcTemplates.size() - 1;
+        }
+        ImGui::EndDisabled();
+
+        ImGui::BeginChild("##tpllist", ImVec2(0, 90), true);
+        for (int i = 0; i < (int)npcTemplates.size(); ++i) {
+            ImGui::PushID(i);
+            if (ImGui::Selectable(npcTemplates[i].name.c_str(), selectedTemplate == i)) selectedTemplate = i;
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+
+        if (selectedTemplate >= 0 && selectedTemplate < (int)npcTemplates.size()) {
+            NPCTemplate& t = npcTemplates[selectedTemplate];
+            ImGui::InputText("Name", &t.name);
+            const char* curMesh = (t.meshId >= 0 && t.meshId < (int)meshLibrary.size())
+                                  ? meshLibrary[t.meshId].name.c_str() : "(none)";
+            if (ImGui::BeginCombo("Mesh", curMesh)) {
+                for (int m = 0; m < (int)meshLibrary.size(); ++m) {
+                    ImGui::PushID(m);
+                    if (ImGui::Selectable(meshLibrary[m].name.c_str(), t.meshId == m)) t.meshId = m;
+                    ImGui::PopID();
+                }
+                ImGui::EndCombo();
+            }
+
+            ImGui::SeparatorText("Attributes");
+            ImGui::DragFloat("Health", &t.attr.health, 1.0f, 0.0f, 100.0f);
+            ImGui::DragFloat("Hunger", &t.attr.hunger, 1.0f, 0.0f, 100.0f);
+            ImGui::SameLine(); ImGui::SetNextItemWidth(60); ImGui::DragFloat("/h##hu", &t.attr.hungerRate, 0.1f, 0.0f, 50.0f);
+            ImGui::DragFloat("Thirst", &t.attr.thirst, 1.0f, 0.0f, 100.0f);
+            ImGui::SameLine(); ImGui::SetNextItemWidth(60); ImGui::DragFloat("/h##th", &t.attr.thirstRate, 0.1f, 0.0f, 50.0f);
+            ImGui::DragFloat("Energy", &t.attr.energy, 1.0f, 0.0f, 100.0f);
+            ImGui::SameLine(); ImGui::SetNextItemWidth(60); ImGui::DragFloat("/h##en", &t.attr.energyRate, 0.1f, 0.0f, 50.0f);
+            ImGui::DragInt("Gold", &t.attr.gold, 1.0f, 0, 1000000);
+            ImGui::DragFloat("Move speed", &t.attr.moveSpeed, 0.1f, 0.0f, 20.0f);
+
+            ImGui::SeparatorText("Custom attributes");
+            int removeC = -1;
+            for (int c = 0; c < (int)t.custom.size(); ++c) {
+                ImGui::PushID(2000 + c);
+                ImGui::SetNextItemWidth(120); ImGui::InputText("##cn", &t.custom[c].first);
+                ImGui::SameLine(); ImGui::SetNextItemWidth(70); ImGui::DragFloat("##cv", &t.custom[c].second, 0.1f);
+                ImGui::SameLine(); if (ImGui::SmallButton("x")) removeC = c;
+                ImGui::PopID();
+            }
+            if (removeC >= 0) t.custom.erase(t.custom.begin() + removeC);
+            if (ImGui::Button("Add attribute")) t.custom.push_back({"attribute", 0.0f});
+
+            ImGui::SeparatorText("Schedule (hour / activity / location)");
+            int removeS = -1;
+            for (int e = 0; e < (int)t.schedule.size(); ++e) {
+                ImGui::PushID(3000 + e);
+                ScheduleEntry& se = t.schedule[e];
+                ImGui::SetNextItemWidth(64); ImGui::DragFloat("##hr", &se.hour, 0.25f, 0.0f, 24.0f, "%.2f");
+                ImGui::SameLine(); ImGui::SetNextItemWidth(80); ImGui::InputText("##act", &se.activity);
+                ImGui::SameLine(); ImGui::SetNextItemWidth(90);
+                if (ImGui::BeginCombo("##loc", se.location.empty() ? "(where)" : se.location.c_str())) {
+                    for (int o = 0; o < (int)scene.size(); ++o) {
+                        ImGui::PushID(o);
+                        if (ImGui::Selectable(scene[o].name.c_str(), se.location == scene[o].name)) se.location = scene[o].name;
+                        ImGui::PopID();
+                    }
+                    ImGui::EndCombo();
+                }
+                ImGui::SameLine(); if (ImGui::SmallButton("x")) removeS = e;
+                ImGui::PopID();
+            }
+            if (removeS >= 0) t.schedule.erase(t.schedule.begin() + removeS);
+            if (ImGui::Button("Add schedule entry")) t.schedule.push_back({8.0f, "work", ""});
+
+            ImGui::Separator();
+            if (ImGui::Button("Place NPC in world")) {
+                SceneObject o;
+                o.name = t.name;
+                o.meshId = t.meshId;
+                o.npcTemplate = selectedTemplate;
+                o.color = glm::vec3(1.0f);
+                scene.push_back(o);
+                selected = (int)scene.size() - 1;
+            }
+        } else {
+            ImGui::TextDisabled("No template selected. Click 'New Template'.");
         }
         ImGui::End();
 
@@ -1366,8 +1682,6 @@ int main() {
                 float gAspect = gh == 0 ? 1.0f : (float)gw / (float)gh;
                 glm::mat4 gView = viewMatrix(gameCam);
                 glm::mat4 gProj = projMatrix(gameCam, gAspect);
-                // Simulation: spin each object about its own origin, on top of its pose.
-                glm::mat4 spin = glm::rotate(glm::mat4(1.0f), cubeAngle, glm::vec3(0.5f, 1.0f, 0.0f));
                 syncMeshes(playRenderer, meshLibrary);   // upload meshes into the play context
                 std::vector<glm::mat4> playModels;
                 std::vector<glm::vec3> playColors;
@@ -1376,11 +1690,11 @@ int main() {
                 playColors.reserve(scene.size());
                 playMeshIds.reserve(scene.size());
                 for (const SceneObject& o : scene) {
-                    playModels.push_back(o.transform * spin);
+                    playModels.push_back(o.transform);
                     playColors.push_back(o.color);
                     playMeshIds.push_back(o.meshId);
                 }
-                renderScene(0, gw, gh, gameCam, gView, gProj, playRenderer, false, true, playModels, playColors, playMeshIds, -1, gridSize);
+                renderScene(0, gw, gh, gameCam, gView, gProj, playRenderer, env, false, true, playModels, playColors, playMeshIds, -1, gridSize);
                 glfwSwapBuffers(playWindow);
             }
         }
