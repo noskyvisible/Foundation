@@ -1,14 +1,12 @@
-// Editor shell, step D: Hammer-style quad-view + play window + gizmos. The cube
-// is now a scene object with an editable transform; click it in the Perspective
-// view to select, then use the ImGuizmo handles (W/E/R = move/rotate/scale).
+// Editor shell: Hammer-style quad-view + play window + gizmos. main.cpp now
+// holds only window/ImGui setup and the per-frame loop; the engine systems live
+// in their own modules (mesh, skinned, camera, environment, scene, renderer,
+// editor, navigation, npc_sim).
 //
 // WebGL parallels:
-//   - An FBO is like an offscreen WebGL framebuffer we render into, then
-//     draw as a texture into a UI region. We have one per viewport.
-//   - A Camera bundles the view + projection matrices; ortho cameras use
-//     glm::ortho instead of glm::perspective (no perspective foreshortening).
-//   - The grid is just a line mesh (GL_LINES) drawn with the same shader as the
-//     cube, oriented into each view's plane by a per-camera model matrix.
+//   - An FBO is like an offscreen WebGL framebuffer we render into, then draw
+//     as a texture into a UI region. We have one per viewport (see renderer.*).
+//   - A Camera bundles the view + projection matrices (see camera.*).
 //   - ImGui is "immediate mode": we rebuild the entire UI every frame inside
 //     the render loop instead of creating persistent panel objects.
 
@@ -26,916 +24,23 @@
 #include "imgui_impl_opengl3.h"
 #include "ImGuizmo.h"         // translate/rotate/scale gizmos
 
-#include <assimp/Importer.hpp>   // GLB/GLTF/FBX/OBJ mesh loading
-#include <assimp/scene.h>
-#include <assimp/postprocess.h>
+#include "camera.h"
+#include "editor.h"
+#include "environment.h"
+#include "mesh.h"
+#include "navigation.h"
+#include "npc_sim.h"
+#include "renderer.h"
+#include "scene.h"
+#include "skinned.h"
 
 #include "platform_file.h"    // native file-open dialog
-#include "stb_image.h"        // decode embedded model textures
 
+#include <algorithm>
 #include <cmath>
-#include <cstdint>
 #include <cstdio>
-#include <fstream>
-#include <sstream>
 #include <string>
-#include <utility>
 #include <vector>
-
-// ---- Shaders -------------------------------------------------------------
-// "line" program: flat per-vertex colour (grid + selection box). "lit" program:
-// per-object colour shaded by a fixed directional light using surface normals.
-
-static const char* kLineVS = R"glsl(
-#version 330 core
-layout (location = 0) in vec3 aPos;
-layout (location = 1) in vec3 aColor;
-uniform mat4 uMVP;
-out vec3 vColor;
-void main() {
-    gl_Position = uMVP * vec4(aPos, 1.0);
-    vColor = aColor;
-}
-)glsl";
-
-static const char* kLineFS = R"glsl(
-#version 330 core
-in vec3 vColor;
-out vec4 FragColor;
-void main() { FragColor = vec4(vColor, 1.0); }
-)glsl";
-
-static const char* kLitVS = R"glsl(
-#version 330 core
-layout (location = 0) in vec3 aPos;
-layout (location = 1) in vec3 aNormal;
-layout (location = 2) in vec2 aUv;
-uniform mat4 uMVP;
-uniform mat4 uModel;
-out vec3 vNormal;
-out vec2 vUv;
-void main() {
-    gl_Position = uMVP * vec4(aPos, 1.0);
-    vNormal = transpose(inverse(mat3(uModel))) * aNormal;  // correct under scale
-    vUv = aUv;
-}
-)glsl";
-
-static const char* kLitFS = R"glsl(
-#version 330 core
-in vec3 vNormal;
-in vec2 vUv;
-uniform vec3 uColor;
-uniform sampler2D uAlbedo;
-uniform int uHasTexture;
-uniform vec3 uLightDir;     // direction TO the sun (normalized)
-uniform vec3 uLightColor;   // sun colour * intensity (dims at night)
-uniform vec3 uAmbient;      // sky ambient (dim blue at night, never black)
-out vec4 FragColor;
-void main() {
-    vec3 n = normalize(vNormal);
-    float diff = max(dot(n, normalize(uLightDir)), 0.0);
-    vec3 base = uColor;
-    if (uHasTexture == 1) base *= texture(uAlbedo, vUv).rgb;
-    FragColor = vec4(base * (uAmbient + uLightColor * diff), 1.0);
-}
-)glsl";
-
-// Procedural sky: a fullscreen triangle (no VBO) shaded by view direction.
-static const char* kSkyVS = R"glsl(
-#version 330 core
-out vec2 vNdc;
-void main() {
-    vec2 p = vec2(float((gl_VertexID & 1) << 2) - 1.0, float((gl_VertexID & 2) << 1) - 1.0);
-    vNdc = p;
-    gl_Position = vec4(p, 1.0, 1.0);
-}
-)glsl";
-
-static const char* kSkyFS = R"glsl(
-#version 330 core
-in vec2 vNdc;
-uniform mat4 uInvViewProj;
-uniform vec3 uCamPos;
-uniform vec3 uSunDir;       // direction TO the sun
-uniform vec3 uHorizon;
-uniform vec3 uZenith;
-uniform vec3 uSunColor;
-out vec4 FragColor;
-void main() {
-    vec4 far = uInvViewProj * vec4(vNdc, 1.0, 1.0);
-    vec3 dir = normalize(far.xyz / far.w - uCamPos);
-    float up = clamp(dir.y, 0.0, 1.0);
-    vec3 col = mix(uHorizon, uZenith, pow(up, 0.45));
-    float s = max(dot(dir, normalize(uSunDir)), 0.0);
-    col += uSunColor * pow(s, 350.0);          // sun disc
-    col += uSunColor * 0.25 * pow(s, 6.0);     // glow
-    FragColor = vec4(col, 1.0);
-}
-)glsl";
-
-static GLuint compileShader(GLenum type, const char* src) {
-    GLuint shader = glCreateShader(type);
-    glShaderSource(shader, 1, &src, nullptr);
-    glCompileShader(shader);
-    GLint ok = 0;
-    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
-    if (!ok) {
-        char log[512];
-        glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
-        std::fprintf(stderr, "Shader compile error:\n%s\n", log);
-    }
-    return shader;
-}
-
-static GLuint createProgram(const char* vsSrc, const char* fsSrc) {
-    GLuint vs = compileShader(GL_VERTEX_SHADER, vsSrc);
-    GLuint fs = compileShader(GL_FRAGMENT_SHADER, fsSrc);
-    GLuint program = glCreateProgram();
-    glAttachShader(program, vs);
-    glAttachShader(program, fs);
-    glLinkProgram(program);
-    GLint ok = 0;
-    glGetProgramiv(program, GL_LINK_STATUS, &ok);
-    if (!ok) {
-        char log[512];
-        glGetProgramInfoLog(program, sizeof(log), nullptr, log);
-        std::fprintf(stderr, "Program link error:\n%s\n", log);
-    }
-    glDeleteShader(vs);
-    glDeleteShader(fs);
-    return program;
-}
-
-// ---- Cube geometry (pos + normal per vertex) -----------------------------
-static const float kCubeVertices[] = {
-    // back face (-Z)
-    -0.5f,-0.5f,-0.5f, 0,0,-1,  0.5f,-0.5f,-0.5f, 0,0,-1,  0.5f, 0.5f,-0.5f, 0,0,-1,
-     0.5f, 0.5f,-0.5f, 0,0,-1, -0.5f, 0.5f,-0.5f, 0,0,-1, -0.5f,-0.5f,-0.5f, 0,0,-1,
-    // front face (+Z)
-    -0.5f,-0.5f, 0.5f, 0,0,1,   0.5f,-0.5f, 0.5f, 0,0,1,   0.5f, 0.5f, 0.5f, 0,0,1,
-     0.5f, 0.5f, 0.5f, 0,0,1,  -0.5f, 0.5f, 0.5f, 0,0,1,  -0.5f,-0.5f, 0.5f, 0,0,1,
-    // left face (-X)
-    -0.5f, 0.5f, 0.5f, -1,0,0, -0.5f, 0.5f,-0.5f, -1,0,0, -0.5f,-0.5f,-0.5f, -1,0,0,
-    -0.5f,-0.5f,-0.5f, -1,0,0, -0.5f,-0.5f, 0.5f, -1,0,0, -0.5f, 0.5f, 0.5f, -1,0,0,
-    // right face (+X)
-     0.5f, 0.5f, 0.5f, 1,0,0,   0.5f, 0.5f,-0.5f, 1,0,0,   0.5f,-0.5f,-0.5f, 1,0,0,
-     0.5f,-0.5f,-0.5f, 1,0,0,   0.5f,-0.5f, 0.5f, 1,0,0,   0.5f, 0.5f, 0.5f, 1,0,0,
-    // bottom face (-Y)
-    -0.5f,-0.5f,-0.5f, 0,-1,0,  0.5f,-0.5f,-0.5f, 0,-1,0,  0.5f,-0.5f, 0.5f, 0,-1,0,
-     0.5f,-0.5f, 0.5f, 0,-1,0, -0.5f,-0.5f, 0.5f, 0,-1,0, -0.5f,-0.5f,-0.5f, 0,-1,0,
-    // top face (+Y)
-    -0.5f, 0.5f,-0.5f, 0,1,0,   0.5f, 0.5f,-0.5f, 0,1,0,   0.5f, 0.5f, 0.5f, 0,1,0,
-     0.5f, 0.5f, 0.5f, 0,1,0,  -0.5f, 0.5f, 0.5f, 0,1,0,  -0.5f, 0.5f,-0.5f, 0,1,0,
-};
-
-// ---- Mesh assets (CPU side) ----------------------------------------------
-// A mesh asset is a list of submeshes (one per material), each a vertex/index
-// buffer + a base colour. The built-in cube is asset #0; loaded models append.
-struct Vertex { glm::vec3 pos; glm::vec3 normal; glm::vec2 uv; };
-struct AABB    { glm::vec3 min{0.0f}; glm::vec3 max{0.0f}; };
-struct SubMesh {
-    std::vector<Vertex>   vertices;
-    std::vector<uint32_t> indices;
-    glm::vec3 baseColor{1.0f};
-    std::vector<uint8_t>  albedo;        // RGBA8 pixels, empty if untextured
-    int albedoW = 0, albedoH = 0;
-};
-struct MeshAsset {
-    std::string name;
-    std::vector<SubMesh> subs;
-    AABB bounds;
-};
-
-static AABB computeBounds(const std::vector<SubMesh>& subs) {
-    AABB b{ glm::vec3(1e30f), glm::vec3(-1e30f) };
-    bool any = false;
-    for (const SubMesh& s : subs)
-        for (const Vertex& v : s.vertices) {
-            b.min = glm::min(b.min, v.pos);
-            b.max = glm::max(b.max, v.pos);
-            any = true;
-        }
-    if (!any) { b.min = glm::vec3(-0.5f); b.max = glm::vec3(0.5f); }
-    return b;
-}
-
-// Build the built-in unit cube as a MeshAsset (from kCubeVertices: pos+normal).
-static MeshAsset buildCubeMesh() {
-    MeshAsset m;
-    m.name = "Cube";
-    SubMesh s;
-    const int vertCount = (int)(sizeof(kCubeVertices) / sizeof(float)) / 6;
-    for (int i = 0; i < vertCount; ++i) {
-        const float* p = &kCubeVertices[i * 6];
-        Vertex v;
-        v.pos    = { p[0], p[1], p[2] };
-        v.normal = { p[3], p[4], p[5] };
-        v.uv     = { 0.0f, 0.0f };
-        s.vertices.push_back(v);
-        s.indices.push_back((uint32_t)i);
-    }
-    s.baseColor = glm::vec3(1.0f);   // white: object tint colour shows through
-    m.subs.push_back(std::move(s));
-    m.bounds = computeBounds(m.subs);
-    return m;
-}
-
-// Filename without directory or extension, e.g. "C:/x/teapot.glb" -> "teapot".
-static std::string fileStem(const std::string& path) {
-    size_t slash = path.find_last_of("/\\");
-    size_t start = (slash == std::string::npos) ? 0 : slash + 1;
-    size_t dot = path.find_last_of('.');
-    size_t end = (dot == std::string::npos || dot < start) ? path.size() : dot;
-    return path.substr(start, end - start);
-}
-
-// Load a model file via Assimp into a MeshAsset (one submesh per Assimp mesh,
-// with its material base colour). Geometry + colours only for now.
-static bool loadModel(const std::string& path, MeshAsset& out) {
-    Assimp::Importer imp;
-    const aiScene* sc = imp.ReadFile(path,
-        aiProcess_Triangulate | aiProcess_GenSmoothNormals |
-        aiProcess_PreTransformVertices | aiProcess_JoinIdenticalVertices);
-    if (!sc || (sc->mFlags & AI_SCENE_FLAGS_INCOMPLETE) || !sc->mRootNode) {
-        std::fprintf(stderr, "Assimp load error: %s\n", imp.GetErrorString());
-        return false;
-    }
-    out = MeshAsset{};
-    out.name = fileStem(path);
-    for (unsigned mi = 0; mi < sc->mNumMeshes; ++mi) {
-        const aiMesh* m = sc->mMeshes[mi];
-        SubMesh s;
-        s.vertices.reserve(m->mNumVertices);
-        for (unsigned v = 0; v < m->mNumVertices; ++v) {
-            Vertex vert;
-            vert.pos = { m->mVertices[v].x, m->mVertices[v].y, m->mVertices[v].z };
-            vert.normal = m->HasNormals()
-                ? glm::vec3(m->mNormals[v].x, m->mNormals[v].y, m->mNormals[v].z)
-                : glm::vec3(0, 1, 0);
-            vert.uv = m->mTextureCoords[0]
-                ? glm::vec2(m->mTextureCoords[0][v].x, m->mTextureCoords[0][v].y)
-                : glm::vec2(0.0f);
-            s.vertices.push_back(vert);
-        }
-        for (unsigned f = 0; f < m->mNumFaces; ++f) {
-            const aiFace& face = m->mFaces[f];
-            for (unsigned k = 0; k < face.mNumIndices; ++k)
-                s.indices.push_back(face.mIndices[k]);
-        }
-        glm::vec3 col(0.8f);
-        bool hasTex = false;
-        if (m->mMaterialIndex < sc->mNumMaterials) {
-            aiMaterial* mat = sc->mMaterials[m->mMaterialIndex];
-            aiColor4D base; aiColor3D diff;
-            if (mat->Get(AI_MATKEY_BASE_COLOR, base) == AI_SUCCESS)        col = { base.r, base.g, base.b };
-            else if (mat->Get(AI_MATKEY_COLOR_DIFFUSE, diff) == AI_SUCCESS) col = { diff.r, diff.g, diff.b };
-
-            // Base-colour / diffuse texture (embedded in the GLB). Some exporters
-            // don't link it through the standard slots, so fall back to the
-            // scene's single embedded texture when the material lookup is empty.
-            const aiTexture* t = nullptr;
-            aiString texPath;
-            if (mat->GetTexture(aiTextureType_BASE_COLOR, 0, &texPath) == AI_SUCCESS ||
-                mat->GetTexture(aiTextureType_DIFFUSE,    0, &texPath) == AI_SUCCESS)
-                t = sc->GetEmbeddedTexture(texPath.C_Str());
-            if (!t && sc->mNumTextures > 0) t = sc->mTextures[0];
-
-            if (t && t->mHeight == 0) {                // compressed (PNG/JPG) bytes
-                stbi_set_flip_vertically_on_load(true);
-                int w, h, n;
-                unsigned char* px = stbi_load_from_memory(
-                    reinterpret_cast<const unsigned char*>(t->pcData), (int)t->mWidth, &w, &h, &n, 4);
-                if (px) {
-                    s.albedo.assign(px, px + (size_t)w * h * 4);
-                    s.albedoW = w; s.albedoH = h; hasTex = true;
-                    stbi_image_free(px);
-                }
-            } else if (t) {                            // raw aiTexel (BGRA)
-                int w = (int)t->mWidth, h = (int)t->mHeight;
-                s.albedo.resize((size_t)w * h * 4);
-                for (int i = 0; i < w * h; ++i) {
-                    s.albedo[i*4+0] = t->pcData[i].r;
-                    s.albedo[i*4+1] = t->pcData[i].g;
-                    s.albedo[i*4+2] = t->pcData[i].b;
-                    s.albedo[i*4+3] = t->pcData[i].a;
-                }
-                s.albedoW = w; s.albedoH = h; hasTex = true;
-            }
-        }
-        if (hasTex)                              col = glm::vec3(1.0f);   // show texture fully
-        else if (glm::dot(col, col) < 0.0009f)   col = glm::vec3(0.8f);   // black factor -> gray
-        s.baseColor = col;
-        out.subs.push_back(std::move(s));
-    }
-    out.bounds = computeBounds(out.subs);
-    return !out.subs.empty();
-}
-
-// ---- Environment: game clock + day/night sky + sun-driven light ----------
-struct Environment {
-    // Authored / controllable state.
-    float timeOfDay   = 9.0f;     // hours, 0-24
-    int   day         = 1;
-    float dayLengthSec = 600.0f;  // real seconds for a full 24h game day
-    bool  running     = true;
-    // Derived each frame from timeOfDay.
-    glm::vec3 sunDir     {0, 1, 0};   // direction TO the sun
-    glm::vec3 sunColor   {1.0f};
-    glm::vec3 horizonColor{0.7f, 0.8f, 0.95f};
-    glm::vec3 zenithColor {0.3f, 0.55f, 0.9f};
-    glm::vec3 lightColor {1.0f};      // directional light colour (0 at night)
-    glm::vec3 ambient    {0.3f};      // sky ambient colour (dim blue at night)
-};
-
-// `advance` should be true only in play mode; the editor freezes the clock
-// (you scrub the time slider to preview). The sky/light are recomputed from
-// timeOfDay regardless, so scrubbing updates the view.
-static void updateEnvironment(Environment& e, float dt, bool advance) {
-    if (advance && e.running && e.dayLengthSec > 0.0f) {
-        e.timeOfDay += dt * (24.0f / e.dayLengthSec);
-        while (e.timeOfDay >= 24.0f) { e.timeOfDay -= 24.0f; ++e.day; }
-        while (e.timeOfDay < 0.0f)   { e.timeOfDay += 24.0f; --e.day; }
-    }
-
-    const float PI = 3.14159265f;
-    float a = (e.timeOfDay - 6.0f) / 12.0f * PI;   // 0 at 06:00, PI at 18:00
-    float elev = std::sin(a);                       // sun elevation, <0 at night
-    e.sunDir = glm::normalize(glm::vec3(std::cos(a), elev, 0.35f));
-
-    float dayAmt = glm::clamp((elev + 0.05f) / 0.30f, 0.0f, 1.0f);  // 0 night -> 1 day
-    float duskAmt = (elev > 0.0f && elev < 0.30f) ? (1.0f - elev / 0.30f) : 0.0f;
-
-    glm::vec3 dayZenith (0.20f, 0.45f, 0.85f), dayHorizon(0.70f, 0.82f, 0.95f);
-    glm::vec3 nightZenith(0.02f, 0.03f, 0.07f), nightHorizon(0.05f, 0.06f, 0.12f);
-    glm::vec3 dusk(0.95f, 0.45f, 0.18f);
-
-    e.zenithColor  = glm::mix(nightZenith,  dayZenith,  dayAmt);
-    e.horizonColor = glm::mix(nightHorizon, dayHorizon, dayAmt) + dusk * duskAmt * 0.8f;
-    e.sunColor     = glm::mix(glm::vec3(1.0f, 0.55f, 0.25f), glm::vec3(1.0f, 0.97f, 0.9f),
-                              glm::clamp(elev / 0.4f, 0.0f, 1.0f));
-    e.lightColor   = e.sunColor * dayAmt;
-    // Night keeps a dim blue ambient so the world stays visible (Skyrim-style),
-    // rising to a neutral grey during the day.
-    glm::vec3 nightAmbient(0.16f, 0.18f, 0.27f);
-    glm::vec3 dayAmbient(0.30f, 0.30f, 0.30f);
-    e.ambient      = glm::mix(nightAmbient, dayAmbient, dayAmt);
-}
-
-// ---- Offscreen render target (one per viewport, later) -------------------
-struct RenderTarget {
-    GLuint fbo = 0;
-    GLuint color = 0;   // texture we display in the UI
-    GLuint depth = 0;   // depth-stencil renderbuffer
-    int width = 0;
-    int height = 0;
-};
-
-// (Re)allocate the FBO's attachments when the panel size changes.
-static void resizeTarget(RenderTarget& rt, int w, int h) {
-    if (rt.fbo && w == rt.width && h == rt.height) return;
-    rt.width = w;
-    rt.height = h;
-
-    if (!rt.fbo) glGenFramebuffers(1, &rt.fbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, rt.fbo);
-
-    if (!rt.color) glGenTextures(1, &rt.color);
-    glBindTexture(GL_TEXTURE_2D, rt.color);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rt.color, 0);
-
-    if (!rt.depth) glGenRenderbuffers(1, &rt.depth);
-    glBindRenderbuffer(GL_RENDERBUFFER, rt.depth);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rt.depth);
-
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-}
-
-static void destroyTarget(RenderTarget& rt) {
-    if (rt.fbo)   glDeleteFramebuffers(1, &rt.fbo);
-    if (rt.color) glDeleteTextures(1, &rt.color);
-    if (rt.depth) glDeleteRenderbuffers(1, &rt.depth);
-    rt = RenderTarget{};
-}
-
-// ---- Camera: bundles where we look from and how we project ---------------
-enum class Projection { Perspective, Ortho };
-
-struct Camera {
-    Projection type = Projection::Perspective;
-    glm::vec3 eye{0, 0, 3};
-    glm::vec3 target{0, 0, 0};
-    glm::vec3 up{0, 1, 0};
-    float fovDeg = 45.0f;           // perspective only
-    float orthoHalfHeight = 1.3f;   // ortho only: half view height in world units
-    glm::mat4 gridModel{1.0f};      // orients the grid mesh into this view's plane
-    const char* label = "";         // shown in the panel corner
-    // Free-fly navigation state (perspective): eye/target are derived from these.
-    glm::vec3 flyPos{0.0f};
-    float yaw = 0.0f, pitch = 0.0f, flySpeed = 4.0f;
-};
-
-// FPS-style forward vector from yaw (around Y) and pitch (around X).
-static glm::vec3 forwardFromYawPitch(float yaw, float pitch) {
-    return glm::vec3(std::cos(pitch) * std::sin(yaw),
-                     std::sin(pitch),
-                    -std::cos(pitch) * std::cos(yaw));
-}
-
-static glm::mat4 viewMatrix(const Camera& c) {
-    return glm::lookAt(c.eye, c.target, c.up);
-}
-
-static glm::mat4 projMatrix(const Camera& c, float aspect) {
-    if (c.type == Projection::Perspective)
-        return glm::perspective(glm::radians(c.fovDeg), aspect, 0.1f, 100.0f);
-    float h = c.orthoHalfHeight;
-    float w = h * aspect;
-    return glm::ortho(-w, w, -h, h, -100.0f, 100.0f);
-}
-
-// ---- Reference grid: a line mesh (pos + colour) in the XY plane (z=0). ----
-// Per-camera gridModel rotates it into each view's plane. Minor lines are dim,
-// every 5th line brighter, and the two centre axes are tinted red/green.
-static constexpr float kGridStep = 0.5f;   // base mesh spacing; scaled at draw time
-
-static void makeGrid(GLuint& vao, GLuint& vbo, int& outVertexCount) {
-    const int   half = 10;          // lines from -10..+10
-    const float step = kGridStep;   // base world units between lines
-    const float ext  = half * step;
-    const glm::vec3 minor(0.18f, 0.18f, 0.21f);
-    const glm::vec3 major(0.30f, 0.30f, 0.36f);
-    const glm::vec3 axisX(0.55f, 0.22f, 0.22f);  // line along X (y=0)
-    const glm::vec3 axisY(0.22f, 0.55f, 0.28f);  // line along Y (x=0)
-
-    std::vector<float> v;
-    auto push = [&](float x, float y, glm::vec3 c) {
-        v.insert(v.end(), {x, y, 0.0f, c.r, c.g, c.b});
-    };
-    for (int i = -half; i <= half; ++i) {
-        float p = i * step;
-        glm::vec3 cv = (i == 0) ? axisY : (i % 5 == 0 ? major : minor);
-        push(p, -ext, cv); push(p, ext, cv);     // vertical line (const x)
-        glm::vec3 ch = (i == 0) ? axisX : (i % 5 == 0 ? major : minor);
-        push(-ext, p, ch); push(ext, p, ch);     // horizontal line (const y)
-    }
-
-    glGenVertexArrays(1, &vao);
-    glGenBuffers(1, &vbo);
-    glBindVertexArray(vao);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, v.size() * sizeof(float), v.data(), GL_STATIC_DRAW);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
-    glEnableVertexAttribArray(1);
-
-    outVertexCount = (int)(v.size() / 6);
-}
-
-// The 12 edges of a slightly-enlarged cube, all in a bright highlight colour --
-// drawn around the selected object as selection feedback (GL_LINES, 24 verts).
-static void makeSelectionBox(GLuint& vao, GLuint& vbo, int& outVertexCount) {
-    const float s = 0.5f;                        // unit box; scaled to the mesh AABB at draw
-    const glm::vec3 hl(1.0f, 0.6f, 0.1f);        // orange
-    const glm::vec3 c[8] = {
-        {-s,-s,-s}, { s,-s,-s}, { s,-s, s}, {-s,-s, s},
-        {-s, s,-s}, { s, s,-s}, { s, s, s}, {-s, s, s},
-    };
-    const int e[12][2] = {
-        {0,1},{1,2},{2,3},{3,0},   // bottom
-        {4,5},{5,6},{6,7},{7,4},   // top
-        {0,4},{1,5},{2,6},{3,7},   // verticals
-    };
-    std::vector<float> v;
-    for (auto& edge : e)
-        for (int k = 0; k < 2; ++k) {
-            glm::vec3 p = c[edge[k]];
-            v.insert(v.end(), {p.x, p.y, p.z, hl.r, hl.g, hl.b});
-        }
-
-    glGenVertexArrays(1, &vao);
-    glGenBuffers(1, &vbo);
-    glBindVertexArray(vao);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, v.size() * sizeof(float), v.data(), GL_STATIC_DRAW);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
-    glEnableVertexAttribArray(1);
-    outVertexCount = (int)(v.size() / 6);
-}
-
-// Bundles the GPU resources the scene needs to draw. VAOs are NOT shared
-// between GL contexts, so each window (editor / play) builds its own Renderer.
-// A mesh asset uploaded to the CURRENT GL context (one per submesh).
-struct GPUSubMesh { GLuint vao = 0, vbo = 0, ebo = 0; GLsizei count = 0; glm::vec3 baseColor{1.0f}; GLuint tex = 0; };
-struct GPUMesh    { std::vector<GPUSubMesh> subs; AABB bounds; };
-
-struct Renderer {
-    GLuint lineProgram = 0;            // grid + selection box (pos+colour, uMVP)
-    GLint  lineMvpLoc = -1;
-    GLuint litProgram = 0;             // objects (pos+normal+uv, lit)
-    GLint  litMvpLoc = -1, litModelLoc = -1, litColorLoc = -1, litHasTexLoc = -1, litAlbedoLoc = -1;
-    GLint  litLightDirLoc = -1, litLightColLoc = -1, litAmbientLoc = -1;
-    GLuint skyProgram = 0, skyVao = 0; // procedural sky (fullscreen triangle)
-    GLint  skyInvVPLoc = -1, skyCamLoc = -1, skySunLoc = -1, skyHorizonLoc = -1, skyZenithLoc = -1, skySunColLoc = -1;
-    GLuint gridVao = 0, gridVbo = 0;   // pos+colour
-    GLuint selBoxVao = 0, selBoxVbo = 0;
-    int    gridVertexCount = 0;
-    int    selBoxVertexCount = 0;
-    std::vector<GPUMesh> meshes;       // parallel to the CPU mesh library
-};
-
-// Upload one CPU mesh asset into the current context.
-static GPUMesh uploadMesh(const MeshAsset& asset) {
-    GPUMesh gm;
-    gm.bounds = asset.bounds;
-    for (const SubMesh& s : asset.subs) {
-        GPUSubMesh g;
-        g.baseColor = s.baseColor;
-        g.count = (GLsizei)s.indices.size();
-        glGenVertexArrays(1, &g.vao);
-        glGenBuffers(1, &g.vbo);
-        glGenBuffers(1, &g.ebo);
-        glBindVertexArray(g.vao);
-        glBindBuffer(GL_ARRAY_BUFFER, g.vbo);
-        glBufferData(GL_ARRAY_BUFFER, s.vertices.size() * sizeof(Vertex), s.vertices.data(), GL_STATIC_DRAW);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.ebo);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, s.indices.size() * sizeof(uint32_t), s.indices.data(), GL_STATIC_DRAW);
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, pos));
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, normal));
-        glEnableVertexAttribArray(1);
-        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, uv));
-        glEnableVertexAttribArray(2);
-
-        if (s.albedoW > 0 && !s.albedo.empty()) {
-            glGenTextures(1, &g.tex);
-            glBindTexture(GL_TEXTURE_2D, g.tex);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, s.albedoW, s.albedoH, 0, GL_RGBA, GL_UNSIGNED_BYTE, s.albedo.data());
-            glGenerateMipmap(GL_TEXTURE_2D);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        }
-        gm.subs.push_back(g);
-    }
-    return gm;
-}
-
-// Upload any library meshes this context hasn't uploaded yet (VAOs/buffers are
-// per-context, so the editor and play windows each build their own copies).
-static void syncMeshes(Renderer& r, const std::vector<MeshAsset>& lib) {
-    for (size_t i = r.meshes.size(); i < lib.size(); ++i)
-        r.meshes.push_back(uploadMesh(lib[i]));
-}
-
-// Build per-context shared resources (programs, grid, selection box).
-static Renderer createRenderer() {
-    Renderer r;
-    r.lineProgram = createProgram(kLineVS, kLineFS);
-    r.lineMvpLoc  = glGetUniformLocation(r.lineProgram, "uMVP");
-    r.litProgram  = createProgram(kLitVS, kLitFS);
-    r.litMvpLoc   = glGetUniformLocation(r.litProgram, "uMVP");
-    r.litModelLoc = glGetUniformLocation(r.litProgram, "uModel");
-    r.litColorLoc = glGetUniformLocation(r.litProgram, "uColor");
-    r.litHasTexLoc = glGetUniformLocation(r.litProgram, "uHasTexture");
-    r.litAlbedoLoc = glGetUniformLocation(r.litProgram, "uAlbedo");
-    r.litLightDirLoc = glGetUniformLocation(r.litProgram, "uLightDir");
-    r.litLightColLoc = glGetUniformLocation(r.litProgram, "uLightColor");
-    r.litAmbientLoc  = glGetUniformLocation(r.litProgram, "uAmbient");
-
-    r.skyProgram   = createProgram(kSkyVS, kSkyFS);
-    r.skyInvVPLoc  = glGetUniformLocation(r.skyProgram, "uInvViewProj");
-    r.skyCamLoc    = glGetUniformLocation(r.skyProgram, "uCamPos");
-    r.skySunLoc    = glGetUniformLocation(r.skyProgram, "uSunDir");
-    r.skyHorizonLoc= glGetUniformLocation(r.skyProgram, "uHorizon");
-    r.skyZenithLoc = glGetUniformLocation(r.skyProgram, "uZenith");
-    r.skySunColLoc = glGetUniformLocation(r.skyProgram, "uSunColor");
-    glGenVertexArrays(1, &r.skyVao);   // empty VAO for the no-VBO fullscreen triangle
-
-    makeGrid(r.gridVao, r.gridVbo, r.gridVertexCount);
-    makeSelectionBox(r.selBoxVao, r.selBoxVbo, r.selBoxVertexCount);
-    return r;
-}
-
-static void destroyRenderer(Renderer& r) {
-    for (GPUMesh& m : r.meshes)
-        for (GPUSubMesh& s : m.subs) {
-            glDeleteVertexArrays(1, &s.vao);
-            glDeleteBuffers(1, &s.vbo);
-            glDeleteBuffers(1, &s.ebo);
-            if (s.tex) glDeleteTextures(1, &s.tex);
-        }
-    glDeleteVertexArrays(1, &r.gridVao);
-    glDeleteVertexArrays(1, &r.selBoxVao);
-    glDeleteVertexArrays(1, &r.skyVao);
-    glDeleteBuffers(1, &r.gridVbo);
-    glDeleteBuffers(1, &r.selBoxVbo);
-    glDeleteProgram(r.lineProgram);
-    glDeleteProgram(r.litProgram);
-    glDeleteProgram(r.skyProgram);
-    r = Renderer{};
-}
-
-// Draw the grid + objects into the target, seen through the given camera.
-// Ortho views always render wireframe; the 3D view follows `wireframe3D`.
-// `models`, `colors`, `meshIds` are parallel per-object arrays. The renderer's
-// meshes must already be synced to the library (see syncMeshes).
-static void renderScene(GLuint fbo, int width, int height, const Camera& cam,
-                        const glm::mat4& view, const glm::mat4& proj, const Renderer& r,
-                        const Environment& env, bool wireframe3D, bool showGrid,
-                        const std::vector<glm::mat4>& models,
-                        const std::vector<glm::vec3>& colors, const std::vector<int>& meshIds,
-                        int selectedIndex = -1, float gridSpacing = kGridStep) {
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-    glViewport(0, 0, width, height);
-    glEnable(GL_DEPTH_TEST);
-    if (cam.type == Projection::Ortho) glClearColor(0.06f, 0.06f, 0.07f, 1.0f);
-    else                               glClearColor(0.11f, 0.11f, 0.13f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-    // Procedural sky behind everything (perspective views only).
-    if (cam.type == Projection::Perspective && r.skyProgram) {
-        glDepthMask(GL_FALSE);
-        glDisable(GL_DEPTH_TEST);
-        glUseProgram(r.skyProgram);
-        glUniformMatrix4fv(r.skyInvVPLoc, 1, GL_FALSE, glm::value_ptr(glm::inverse(proj * view)));
-        glUniform3fv(r.skyCamLoc, 1, glm::value_ptr(cam.eye));
-        glUniform3fv(r.skySunLoc, 1, glm::value_ptr(env.sunDir));
-        glUniform3fv(r.skyHorizonLoc, 1, glm::value_ptr(env.horizonColor));
-        glUniform3fv(r.skyZenithLoc, 1, glm::value_ptr(env.zenithColor));
-        glUniform3fv(r.skySunColLoc, 1, glm::value_ptr(env.sunColor));
-        glBindVertexArray(r.skyVao);
-        glDrawArrays(GL_TRIANGLES, 0, 3);
-        glEnable(GL_DEPTH_TEST);
-        glDepthMask(GL_TRUE);
-    }
-
-    // Grid (unlit lines), oriented into this view's plane and scaled to the
-    // requested grid size.
-    if (showGrid && r.gridVao) {
-        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-        glUseProgram(r.lineProgram);
-        glm::mat4 gridM = cam.gridModel * glm::scale(glm::mat4(1.0f), glm::vec3(gridSpacing / kGridStep));
-        glm::mat4 gridMVP = proj * view * gridM;
-        glUniformMatrix4fv(r.lineMvpLoc, 1, GL_FALSE, glm::value_ptr(gridMVP));
-        glBindVertexArray(r.gridVao);
-        glDrawArrays(GL_LINES, 0, r.gridVertexCount);
-    }
-
-    // Objects: lit, per-object colour (tint) * submesh base colour. Wireframe in ortho.
-    bool wire = (cam.type == Projection::Ortho) || wireframe3D;
-    glPolygonMode(GL_FRONT_AND_BACK, wire ? GL_LINE : GL_FILL);
-    glUseProgram(r.litProgram);
-    glUniform1i(r.litAlbedoLoc, 0);   // albedo sampler -> texture unit 0
-    glUniform3fv(r.litLightDirLoc, 1, glm::value_ptr(env.sunDir));
-    glUniform3fv(r.litLightColLoc, 1, glm::value_ptr(env.lightColor));
-    glUniform3fv(r.litAmbientLoc, 1, glm::value_ptr(env.ambient));
-    for (size_t i = 0; i < models.size(); ++i) {
-        int mid = i < meshIds.size() ? meshIds[i] : 0;
-        if (mid < 0 || mid >= (int)r.meshes.size()) continue;
-        glm::vec3 tint = i < colors.size() ? colors[i] : glm::vec3(1.0f);
-        glUniformMatrix4fv(r.litMvpLoc, 1, GL_FALSE, glm::value_ptr(proj * view * models[i]));
-        glUniformMatrix4fv(r.litModelLoc, 1, GL_FALSE, glm::value_ptr(models[i]));
-        for (const GPUSubMesh& s : r.meshes[mid].subs) {
-            glm::vec3 c = s.baseColor * tint;
-            glUniform3fv(r.litColorLoc, 1, glm::value_ptr(c));
-            // Skip the texture in wireframe so the lines are plain, not textured.
-            bool useTex = !wire && s.tex;
-            glUniform1i(r.litHasTexLoc, useTex ? 1 : 0);
-            if (useTex) { glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, s.tex); }
-            glBindVertexArray(s.vao);
-            glDrawElements(GL_TRIANGLES, s.count, GL_UNSIGNED_INT, 0);
-        }
-    }
-
-    // Selection highlight: an orange wireframe box scaled to the object's AABB.
-    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-    if (selectedIndex >= 0 && selectedIndex < (int)models.size() && r.selBoxVao) {
-        int mid = selectedIndex < (int)meshIds.size() ? meshIds[selectedIndex] : 0;
-        AABB b = (mid >= 0 && mid < (int)r.meshes.size()) ? r.meshes[mid].bounds : AABB{glm::vec3(-0.5f), glm::vec3(0.5f)};
-        glm::vec3 center = 0.5f * (b.min + b.max);
-        glm::vec3 size   = glm::max(b.max - b.min, glm::vec3(1e-3f)) * 1.03f;  // small margin
-        glm::mat4 boxM = models[selectedIndex] * glm::translate(glm::mat4(1.0f), center) * glm::scale(glm::mat4(1.0f), size);
-        glUseProgram(r.lineProgram);
-        glUniformMatrix4fv(r.lineMvpLoc, 1, GL_FALSE, glm::value_ptr(proj * view * boxM));
-        glBindVertexArray(r.selBoxVao);
-        glDrawArrays(GL_LINES, 0, r.selBoxVertexCount);
-    }
-
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-}
-
-// Ray vs an axis-aligned box [bmin,bmax] in the object's local space. Returns
-// the entry distance (0 if inside), or -1 on a miss. The ray parameter t is the
-// same in world and local space, so values compare across objects for picking.
-static float rayAabbT(glm::vec3 ro, glm::vec3 rd, const glm::mat4& model,
-                      glm::vec3 bmin, glm::vec3 bmax) {
-    glm::mat4 inv = glm::inverse(model);
-    glm::vec3 o = glm::vec3(inv * glm::vec4(ro, 1.0f));
-    glm::vec3 d = glm::vec3(inv * glm::vec4(rd, 0.0f));
-    float tmin = -1e30f, tmax = 1e30f;
-    for (int i = 0; i < 3; ++i) {
-        if (std::fabs(d[i]) < 1e-8f) {
-            if (o[i] < bmin[i] || o[i] > bmax[i]) return -1.0f;
-        } else {
-            float t1 = (bmin[i] - o[i]) / d[i];
-            float t2 = (bmax[i] - o[i]) / d[i];
-            if (t1 > t2) { float tmp = t1; t1 = t2; t2 = tmp; }
-            tmin = tmin > t1 ? tmin : t1;
-            tmax = tmax < t2 ? tmax : t2;
-            if (tmin > tmax) return -1.0f;
-        }
-    }
-    if (tmax < 0.0f) return -1.0f;
-    return tmin >= 0.0f ? tmin : 0.0f;
-}
-
-// A scene object: a named transform + colour (tint) + which mesh asset it uses.
-// npcTemplate >= 0 marks this object as a placed NPC instance of that template.
-struct SceneObject {
-    std::string name;
-    glm::mat4 transform{1.0f};
-    glm::vec3 color{0.75f, 0.75f, 0.8f};
-    int meshId = 0;        // index into the mesh library (0 = built-in cube)
-    int npcTemplate = -1;  // index into npcTemplates, or -1 if a plain object
-};
-
-// ---- NPC definition (template) -------------------------------------------
-// One schedule entry: at `hour` the NPC goes to `location` (a scene object's
-// name) and performs `activity`. Used by the simulation layer (later).
-struct ScheduleEntry {
-    float       hour = 8.0f;       // 0-24
-    std::string activity = "work";
-    std::string location = "";     // name of a scene object to go to
-};
-
-// Curated survival/RPG stats. Needs are 0-100 and deplete at a per-game-hour
-// rate; the simulation will refill them by eating/drinking/resting.
-struct NPCAttributes {
-    float health = 100.0f;
-    float hunger = 100.0f, hungerRate = 4.0f;
-    float thirst = 100.0f, thirstRate = 6.0f;
-    float energy = 100.0f, energyRate = 4.0f;
-    int   gold = 50;
-    float moveSpeed = 1.5f;        // world units / second
-};
-
-// A reusable NPC type: mesh + attributes + custom fields + a daily schedule.
-struct NPCTemplate {
-    std::string name = "NPC";
-    int meshId = 0;                // which mesh asset this NPC uses
-    NPCAttributes attr;
-    std::vector<std::pair<std::string, float>> custom;  // user-defined attributes
-    std::vector<ScheduleEntry> schedule;
-};
-
-// Plain-text scene format: a header + count, then per object a name line and a
-// line of 16 floats (the column-major transform). No external dependency.
-static bool saveScene(const std::vector<SceneObject>& scene, const char* path) {
-    std::ofstream f(path);
-    if (!f) return false;
-    f << "FOUNDATION_SCENE 2\n" << scene.size() << "\n";
-    for (const SceneObject& o : scene) {
-        f << o.name << "\n";
-        const float* m = glm::value_ptr(o.transform);
-        for (int i = 0; i < 16; ++i) f << m[i] << (i == 15 ? '\n' : ' ');
-        f << o.color.r << ' ' << o.color.g << ' ' << o.color.b << '\n';
-    }
-    return (bool)f;
-}
-
-static bool loadScene(std::vector<SceneObject>& out, const char* path) {
-    std::ifstream f(path);
-    if (!f) return false;
-    std::string header;
-    if (!std::getline(f, header) || header.rfind("FOUNDATION_SCENE", 0) != 0) return false;
-    std::string countLine;
-    if (!std::getline(f, countLine)) return false;
-    int count = std::atoi(countLine.c_str());
-
-    std::vector<SceneObject> loaded;
-    for (int i = 0; i < count; ++i) {
-        SceneObject o;
-        if (!std::getline(f, o.name)) return false;
-        std::string nums;
-        if (!std::getline(f, nums)) return false;
-        std::istringstream ss(nums);
-        float* m = glm::value_ptr(o.transform);
-        for (int k = 0; k < 16; ++k) ss >> m[k];
-        std::string colLine;            // version 2+ stores an RGB colour line
-        if (std::getline(f, colLine)) {
-            std::istringstream cs(colLine);
-            cs >> o.color.r >> o.color.g >> o.color.b;
-        }
-        loaded.push_back(o);
-    }
-    out = std::move(loaded);
-    return true;
-}
-
-// Editing context for the active viewport: the scene + current selection index.
-struct EditContext {
-    std::vector<SceneObject>* scene = nullptr;
-    const std::vector<MeshAsset>* lib = nullptr;  // for per-object AABB picking
-    int* selected = nullptr;          // index into scene, -1 = none
-    ImGuizmo::OPERATION op = ImGuizmo::TRANSLATE;
-    ImGuizmo::MODE mode = ImGuizmo::WORLD;
-    bool  snap = false;               // snap gizmo drags to increments
-    float snapTranslate = 1.0f;       // world units (== grid size)
-    float snapRotate = 15.0f;         // degrees
-    float snapScale = 0.25f;
-};
-
-// One dockable panel that renders `cam`'s view of the scene into `rt`, with the
-// image filling the panel edge-to-edge and the view label in the top-left. If
-// `edit` is supplied, draws a gizmo for the selected object and handles
-// click-to-select. Returns true if the viewport image was hovered this frame.
-static bool drawViewportPanel(const char* name, RenderTarget& rt, const Camera& cam,
-                              const Renderer& r, const Environment& env, bool wireframe3D, bool showGrid,
-                              const std::vector<glm::mat4>& models, const std::vector<glm::vec3>& colors,
-                              const std::vector<int>& meshIds,
-                              int selectedIndex, float gridSpacing, EditContext* edit = nullptr) {
-    bool imageHovered = false;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::Begin(name);
-    ImGui::PopStyleVar();
-
-    ImVec2 avail = ImGui::GetContentRegionAvail();
-    int w = (int)avail.x, h = (int)avail.y;
-    if (w > 0 && h > 0) {
-        float aspect = h == 0 ? 1.0f : (float)w / (float)h;
-        glm::mat4 view = viewMatrix(cam);
-        glm::mat4 proj = projMatrix(cam, aspect);
-
-        resizeTarget(rt, w, h);
-        renderScene(rt.fbo, rt.width, rt.height, cam, view, proj, r, env, wireframe3D, showGrid, models, colors, meshIds, selectedIndex, gridSpacing);
-        // Flip V (uv 0,1 -> 1,0): GL textures have origin at bottom-left.
-        ImGui::Image((ImTextureID)(intptr_t)rt.color, avail, ImVec2(0, 1), ImVec2(1, 0));
-        imageHovered = ImGui::IsItemHovered();
-
-        ImVec2 p0 = ImGui::GetItemRectMin();
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        dl->AddText(ImVec2(p0.x + 6, p0.y + 4), IM_COL32(210, 210, 220, 255), cam.label);
-
-        if (edit && edit->scene && edit->selected) {
-            std::vector<SceneObject>& scene = *edit->scene;
-            int sel = *edit->selected;
-            // Gizmo for the selected object, clipped to this viewport's rect.
-            if (sel >= 0 && sel < (int)scene.size()) {
-                ImGuizmo::SetOrthographic(cam.type == Projection::Ortho);
-                ImGuizmo::SetDrawlist();
-                ImGuizmo::SetRect(p0.x, p0.y, (float)w, (float)h);
-                float snapVal[3] = {0, 0, 0};
-                const float* snapPtr = nullptr;
-                if (edit->snap) {
-                    if (edit->op == ImGuizmo::TRANSLATE)   { snapVal[0] = snapVal[1] = snapVal[2] = edit->snapTranslate; }
-                    else if (edit->op == ImGuizmo::ROTATE) { snapVal[0] = edit->snapRotate; }
-                    else                                   { snapVal[0] = edit->snapScale; }
-                    snapPtr = snapVal;
-                }
-                ImGuizmo::Manipulate(glm::value_ptr(view), glm::value_ptr(proj),
-                                     edit->op, edit->mode, glm::value_ptr(scene[sel].transform),
-                                     nullptr, snapPtr);
-            }
-            // Click-to-select: nearest object hit by the ray, unless over the gizmo.
-            if (imageHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)
-                && !ImGuizmo::IsOver() && !ImGuizmo::IsUsing()) {
-                ImVec2 m = ImGui::GetIO().MousePos;
-                float nx = 2.0f * (m.x - p0.x) / (float)w - 1.0f;
-                float ny = 1.0f - 2.0f * (m.y - p0.y) / (float)h;
-                glm::mat4 invVP = glm::inverse(proj * view);
-                glm::vec4 pn = invVP * glm::vec4(nx, ny, -1.0f, 1.0f); pn /= pn.w;
-                glm::vec4 pf = invVP * glm::vec4(nx, ny,  1.0f, 1.0f); pf /= pf.w;
-                glm::vec3 ro = glm::vec3(pn);
-                glm::vec3 rd = glm::normalize(glm::vec3(pf) - glm::vec3(pn));
-                int best = -1; float bestT = 1e30f;
-                for (int i = 0; i < (int)scene.size(); ++i) {
-                    glm::vec3 bmin(-0.5f), bmax(0.5f);
-                    if (edit->lib) {
-                        int mid = scene[i].meshId;
-                        if (mid >= 0 && mid < (int)edit->lib->size()) {
-                            bmin = (*edit->lib)[mid].bounds.min;
-                            bmax = (*edit->lib)[mid].bounds.max;
-                        }
-                    }
-                    float t = rayAabbT(ro, rd, scene[i].transform, bmin, bmax);
-                    if (t >= 0.0f && t < bestT) { bestT = t; best = i; }
-                }
-                *edit->selected = best;
-            }
-        }
-    }
-    ImGui::End();
-    return imageHovered;
-}
 
 int main() {
     if (!glfwInit()) {
@@ -998,6 +103,10 @@ int main() {
     std::vector<MeshAsset> meshLibrary;
     meshLibrary.push_back(buildCubeMesh());
 
+    // Skinned (animated) mesh library: parallel to meshLibrary but for rigged
+    // GLB characters. A SceneObject is skinned when skinnedId >= 0.
+    std::vector<SkinnedMesh> skinnedLibrary;
+
     // NPC templates (reusable types). Instances are SceneObjects whose
     // npcTemplate indexes into this list.
     std::vector<NPCTemplate> npcTemplates;
@@ -1024,6 +133,36 @@ int main() {
             scene.push_back({"Cube", glm::mat4(1.0f)});
         }
     }
+
+    // Load the rigged demo character (Scarlet Heigns) and drop one instance next
+    // to the test model so she's visible/animating on launch.
+    {
+        const char* candidates[] = {
+            "models/Scarlet Heigns/scarletHeigns.glb",
+            "../models/Scarlet Heigns/scarletHeigns.glb",
+            "scarletHeigns.glb",
+        };
+        SkinnedMesh sm;
+        bool loaded = false;
+        for (const char* c : candidates) if (loadSkinnedModel(c, sm)) { loaded = true; break; }
+        if (loaded) {
+            std::fprintf(stderr, "Loaded skinned '%s': %zu bones, %zu clips, bounds min(%.1f,%.1f,%.1f) max(%.1f,%.1f,%.1f)\n",
+                         sm.name.c_str(), sm.boneOffsets.size(), sm.animations.size(),
+                         sm.bounds.min.x, sm.bounds.min.y, sm.bounds.min.z,
+                         sm.bounds.max.x, sm.bounds.max.y, sm.bounds.max.z);
+            std::fflush(stderr);
+            skinnedLibrary.push_back(std::move(sm));
+            SceneObject o;
+            o.name      = skinnedLibrary.back().name;
+            o.skinnedId = (int)skinnedLibrary.size() - 1;
+            o.meshId    = -1;
+            o.color     = glm::vec3(1.0f);
+            o.transform = glm::translate(glm::mat4(1.0f), glm::vec3(2.0f, 0.0f, 0.0f));
+            scene.push_back(o);
+        } else {
+            std::fprintf(stderr, "Could not load scarletHeigns.glb (no skinned demo).\n");
+        }
+    }
     int selected = scene.empty() ? -1 : 0;   // index into scene, -1 = none
     ImGuizmo::OPERATION gizmoOp = ImGuizmo::TRANSLATE;
     ImGuizmo::MODE      gizmoMode = ImGuizmo::WORLD;
@@ -1042,11 +181,19 @@ int main() {
     // running the game; the editor stays static.
     GLFWwindow* playWindow   = nullptr;
     Renderer    playRenderer{};
+    // NPC simulation lives only while playing. The scene is snapshotted on Play
+    // and restored on Stop, so NPC movement doesn't disturb the authored scene.
+    std::vector<SceneObject> sceneBackup;
+    std::vector<NPCRuntime>  npcRuntimes;
+    NavGrid                  navGrid;
     bool        prevF5       = false;  // edge-detect the F5 toggle (editor window)
     bool        prevPlayF11  = false;  // edge-detect F11 (play window fullscreen)
     bool        playFullscreen = false;
+    bool        playLooking  = false;  // RMB-held mouselook in the play window
+    double      playLastMouseX = 0.0, playLastMouseY = 0.0;
     int         playWinX = 0, playWinY = 0, playWinW = 1280, playWinH = 720;
     double      lastTime = glfwGetTime();
+    float       animClock = 0.0f;      // always-running clock that drives skinned playback
 
     // Game camera used by the play window: a simple perspective view.
     Camera gameCam;
@@ -1068,6 +215,20 @@ int main() {
         playRenderer = createRenderer();
         glfwMakeContextCurrent(window);   // restore editor context
         playFullscreen = false;
+
+        // Seed the free-fly state from the authored eye/target so WASD + RMB
+        // mouselook start where the camera is pointing.
+        gameCam.flyPos = gameCam.eye;
+        glm::vec3 d0 = glm::normalize(gameCam.target - gameCam.eye);
+        gameCam.yaw   = std::atan2(d0.x, -d0.z);
+        gameCam.pitch = std::asin(glm::clamp(d0.y, -1.0f, 1.0f));
+        playLooking = false;
+
+        // Snapshot the scene, build a nav grid from the static objects, and seed
+        // live NPC state. Stop restores the snapshot.
+        sceneBackup = scene;
+        buildNavFromScene(navGrid, scene, npcTemplates, meshLibrary, skinnedLibrary);
+        seedNPCs(npcRuntimes, scene, npcTemplates);
     };
     auto closePlay = [&]() {
         glfwMakeContextCurrent(playWindow);
@@ -1075,6 +236,11 @@ int main() {
         glfwMakeContextCurrent(window);
         glfwDestroyWindow(playWindow);
         playWindow = nullptr;
+        playLooking = false;
+        // Restore the authored scene; discard runtime NPC movement.
+        if (!sceneBackup.empty()) scene = sceneBackup;
+        sceneBackup.clear();
+        npcRuntimes.clear();
     };
 
     // Four viewports: a perspective 3/4 view plus three orthographic views
@@ -1207,13 +373,20 @@ int main() {
         if (selected >= (int)scene.size()) selected = (int)scene.size() - 1;
     };
     auto doSave = [&]() {
-        sceneStatus = saveScene(scene, kScenePath) ? "Saved scene.fdn" : "Save FAILED";
+        sceneStatus = saveScene(scene, meshLibrary, skinnedLibrary, kScenePath)
+                          ? "Saved scene.fdn" : "Save FAILED";
     };
     auto doLoad = [&]() {
         std::vector<SceneObject> loaded;
-        if (loadScene(loaded, kScenePath)) {
+        std::vector<MeshAsset>   loadedMesh;
+        std::vector<SkinnedMesh> loadedSkin;
+        if (loadScene(loaded, loadedMesh, loadedSkin, kScenePath)) {
             snapshot();
             scene = std::move(loaded);
+            // v3 files rebuild the libraries; v2 leaves them empty (keep ours).
+            if (!loadedMesh.empty()) meshLibrary    = std::move(loadedMesh);
+            if (!loadedSkin.empty()) skinnedLibrary = std::move(loadedSkin);
+            invalidateGPUMeshes(renderer);   // editor context is current here
             selected = scene.empty() ? -1 : 0;
             sceneStatus = "Loaded scene.fdn";
         } else sceneStatus = "Load FAILED (no scene.fdn?)";
@@ -1234,6 +407,29 @@ int main() {
             sceneStatus = "Loaded " + o.name;
         } else sceneStatus = "Mesh load FAILED";
     };
+    // Place an instance of an already-loaded skinned mesh into the scene.
+    auto doPlaceSkinned = [&](int sid) {
+        if (sid < 0 || sid >= (int)skinnedLibrary.size()) return;
+        snapshot();
+        SceneObject o;
+        o.name      = skinnedLibrary[sid].name;
+        o.skinnedId = sid;
+        o.meshId    = -1;
+        o.color     = glm::vec3(1.0f);
+        scene.push_back(o);
+        selected = (int)scene.size() - 1;
+    };
+    // Import a rigged GLB/FBX into the skinned library and place one instance.
+    auto doLoadSkinned = [&]() {
+        std::string path = openModelFileDialog("models");
+        if (path.empty()) return;
+        SkinnedMesh sm;
+        if (loadSkinnedModel(path, sm)) {
+            skinnedLibrary.push_back(std::move(sm));
+            sceneStatus = "Loaded skinned " + skinnedLibrary.back().name;
+            doPlaceSkinned((int)skinnedLibrary.size() - 1);   // snapshots + selects
+        } else sceneStatus = "Skinned load FAILED";
+    };
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -1252,7 +448,13 @@ int main() {
         double now = glfwGetTime();
         float  dt  = (float)(now - lastTime);
         lastTime   = now;
+        animClock += dt;                                     // skinned preview always plays
         updateEnvironment(env, dt, playWindow != nullptr);   // clock ticks only in play mode
+
+        // Layer 3: scheduled NPC simulation (play mode only). Walks placed NPCs
+        // along A* paths to their scheduled locations and updates their needs.
+        if (playWindow)
+            simulateNPCs(npcRuntimes, scene, npcTemplates, navGrid, env, dt);
 
         // ---- Editor render (editor GL context) ----
         glfwMakeContextCurrent(window);
@@ -1292,6 +494,7 @@ int main() {
                 if (ImGui::MenuItem("Save", "Ctrl+S"))            doSave();
                 if (ImGui::MenuItem("Load"))                      doLoad();
                 if (ImGui::MenuItem("Load Mesh (GLB/FBX)..."))    doLoadMesh();
+                if (ImGui::MenuItem("Load Skinned Mesh (GLB)...")) doLoadSkinned();
                 ImGui::Separator();
                 if (ImGui::MenuItem("Exit"))                      glfwSetWindowShouldClose(window, true);
                 ImGui::EndMenu();
@@ -1309,6 +512,15 @@ int main() {
             if (ImGui::BeginMenu("Create")) {
                 if (ImGui::MenuItem("Cube"))                   doAddCube();
                 if (ImGui::MenuItem("Mesh (GLB/FBX)..."))      doLoadMesh();
+                if (ImGui::MenuItem("Skinned Mesh (GLB)..."))  doLoadSkinned();
+                if (!skinnedLibrary.empty() && ImGui::BeginMenu("Place Skinned")) {
+                    for (int s = 0; s < (int)skinnedLibrary.size(); ++s) {
+                        ImGui::PushID(s);
+                        if (ImGui::MenuItem(skinnedLibrary[s].name.c_str())) doPlaceSkinned(s);
+                        ImGui::PopID();
+                    }
+                    ImGui::EndMenu();
+                }
                 ImGui::EndMenu();
             }
             if (ImGui::BeginMenu("Layout")) {
@@ -1347,13 +559,15 @@ int main() {
         EditContext edit;
         edit.scene = &scene;
         edit.lib = &meshLibrary;
+        edit.skinnedLib = &skinnedLibrary;
         edit.selected = &selected;
         edit.op = gizmoOp;
         edit.mode = gizmoMode;
         edit.snap = snapEnabled;
         edit.snapTranslate = gridSize;
 
-        syncMeshes(renderer, meshLibrary);   // upload any newly-loaded meshes (editor context)
+        syncMeshes(renderer, meshLibrary);       // upload any newly-loaded meshes (editor context)
+        syncSkinned(renderer, skinnedLibrary);   // ...and skinned meshes
         std::vector<glm::mat4> editorModels;
         std::vector<glm::vec3> editorColors;
         std::vector<int>       editorMeshIds;
@@ -1363,8 +577,37 @@ int main() {
         for (const SceneObject& o : scene) {
             editorModels.push_back(o.transform);
             editorColors.push_back(o.color);
-            editorMeshIds.push_back(o.meshId);
+            // Skinned objects draw via the skin path; -1 makes the static loop skip them.
+            editorMeshIds.push_back(o.skinnedId >= 0 ? -1 : o.meshId);
         }
+
+        // Build the skinned draw list: one item per skinned scene object, each with
+        // a bone palette solved from its clip at the current preview time. Palettes
+        // live in editorPalettes (reserved up-front so its storage never moves while
+        // we take pointers into it).
+        std::vector<SkinnedDrawItem>          editorSkins;
+        std::vector<std::vector<glm::mat4>>   editorPalettes;
+        editorPalettes.reserve(scene.size());
+        for (int i = 0; i < (int)scene.size(); ++i) {
+            const SceneObject& o = scene[i];
+            if (o.skinnedId < 0 || o.skinnedId >= (int)skinnedLibrary.size()) continue;
+            const SkinnedMesh& sm = skinnedLibrary[o.skinnedId];
+            editorPalettes.emplace_back();
+            if (!sm.animations.empty()) {
+                int ci = glm::clamp(o.animClip, 0, (int)sm.animations.size() - 1);
+                computeBoneMatrices(sm, sm.animations[ci], animClock, editorPalettes.back());
+            } else {
+                computeBoneMatrices(sm, Animation{}, 0.0f, editorPalettes.back());  // bind pose
+            }
+            SkinnedDrawItem it;
+            it.skinnedId  = o.skinnedId;
+            it.sceneIndex = i;
+            it.model      = o.transform;
+            it.color      = o.color;
+            editorSkins.push_back(it);
+        }
+        for (size_t k = 0; k < editorSkins.size(); ++k)
+            editorSkins[k].palette = &editorPalettes[k];
 
         // Snapshot before any gizmo edit this frame, so a drag that starts now
         // can be undone back to this pre-drag state.
@@ -1375,10 +618,10 @@ int main() {
         int hoveredView = -1;
         auto drawView = [&](int i) -> bool {
             switch (i) {
-                case 0: return drawViewportPanel("Perspective", rtPersp, camPersp, renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize, &edit);
-                case 1: return drawViewportPanel("Top",   rtTop,   camTop,   renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize);
-                case 2: return drawViewportPanel("Front", rtFront, camFront, renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize);
-                default:return drawViewportPanel("Right", rtRight, camRight, renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize);
+                case 0: return drawViewportPanel("Perspective", rtPersp, camPersp, renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize, editorSkins, &edit);
+                case 1: return drawViewportPanel("Top",   rtTop,   camTop,   renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize, editorSkins);
+                case 2: return drawViewportPanel("Front", rtFront, camFront, renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize, editorSkins);
+                default:return drawViewportPanel("Right", rtRight, camRight, renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize, editorSkins);
             }
         };
         if (layoutSingle) {
@@ -1497,6 +740,12 @@ int main() {
         ImGui::SetNextItemWidth(120.0f);
         ImGui::SliderFloat("Day length (s)", &env.dayLengthSec, 10.0f, 3600.0f, "%.0f");
         ImGui::TextDisabled("Real seconds per full 24h day.");
+
+        ImGui::SeparatorText("Sky");
+        ImGui::SliderFloat("Cloud cover", &env.cloudCover, 0.0f, 1.0f, "%.2f");
+        ImGui::SliderFloat("Exposure",    &env.exposure,   0.2f, 3.0f, "%.2f");
+        ImGui::TextDisabled("Physically-based atmosphere; clouds drift on their own.");
+
         ImGui::Separator();
         ImGui::TextWrapped("Time only advances in Play mode (F5). In the editor, drag the time slider to preview the sky. NPC schedules use this clock.");
         ImGui::End();
@@ -1528,10 +777,46 @@ int main() {
             propActivated |= ImGui::IsItemActivated();
             ImGui::TextDisabled("Texture: drop files in materials/ (coming soon)");
 
+            if (o.skinnedId >= 0 && o.skinnedId < (int)skinnedLibrary.size()) {
+                const SkinnedMesh& sm = skinnedLibrary[o.skinnedId];
+                ImGui::SeparatorText("Animation");
+                if (!sm.animations.empty()) {
+                    o.animClip = glm::clamp(o.animClip, 0, (int)sm.animations.size() - 1);
+                    if (ImGui::BeginCombo("Clip", sm.animations[o.animClip].name.c_str())) {
+                        for (int a = 0; a < (int)sm.animations.size(); ++a) {
+                            ImGui::PushID(a);
+                            if (ImGui::Selectable(sm.animations[a].name.c_str(), o.animClip == a)) o.animClip = a;
+                            ImGui::PopID();
+                        }
+                        ImGui::EndCombo();
+                    }
+                    ImGui::TextDisabled("%.2fs clip, playing on preview clock.", sm.animations[o.animClip].seconds());
+                } else {
+                    ImGui::TextDisabled("No animation clips in this mesh.");
+                }
+            }
+
             if (o.npcTemplate >= 0 && o.npcTemplate < (int)npcTemplates.size()) {
                 ImGui::SeparatorText("NPC");
                 ImGui::Text("Template: %s", npcTemplates[o.npcTemplate].name.c_str());
-                ImGui::TextDisabled("Edit the type in the NPC Editor tab.");
+                // Live runtime state while playing: needs bars + current task.
+                const NPCRuntime* rt = nullptr;
+                for (const NPCRuntime& n : npcRuntimes)
+                    if (n.sceneIndex == selected) { rt = &n; break; }
+                if (rt) {
+                    ImGui::ProgressBar(rt->health / 100.0f, ImVec2(-FLT_MIN, 0), "Health");
+                    ImGui::ProgressBar(rt->hunger / 100.0f, ImVec2(-FLT_MIN, 0), "Hunger");
+                    ImGui::ProgressBar(rt->thirst / 100.0f, ImVec2(-FLT_MIN, 0), "Thirst");
+                    ImGui::ProgressBar(rt->energy / 100.0f, ImVec2(-FLT_MIN, 0), "Energy");
+                    ImGui::Text("Activity: %s", rt->activity.c_str());
+                    if (!rt->targetName.empty())
+                        ImGui::Text("Heading to: %s%s", rt->targetName.c_str(),
+                                    rt->moving ? " (walking)" : " (arrived)");
+                    else
+                        ImGui::TextDisabled("No scheduled target.");
+                } else {
+                    ImGui::TextDisabled("Press Play (F5) to simulate. Edit the type in the NPC Editor tab.");
+                }
             }
 
             if (propActivated) snapshot();
@@ -1572,15 +857,54 @@ int main() {
         if (selectedTemplate >= 0 && selectedTemplate < (int)npcTemplates.size()) {
             NPCTemplate& t = npcTemplates[selectedTemplate];
             ImGui::InputText("Name", &t.name);
-            const char* curMesh = (t.meshId >= 0 && t.meshId < (int)meshLibrary.size())
-                                  ? meshLibrary[t.meshId].name.c_str() : "(none)";
-            if (ImGui::BeginCombo("Mesh", curMesh)) {
+            // Mesh picker lists static meshes first, then skinned (animated) ones.
+            // Choosing a skinned mesh sets skinnedId (and clears meshId, -1).
+            std::string curMesh;
+            if (t.skinnedId >= 0 && t.skinnedId < (int)skinnedLibrary.size())
+                curMesh = "[anim] " + skinnedLibrary[t.skinnedId].name;
+            else if (t.meshId >= 0 && t.meshId < (int)meshLibrary.size())
+                curMesh = meshLibrary[t.meshId].name;
+            else
+                curMesh = "(none)";
+            if (ImGui::BeginCombo("Mesh", curMesh.c_str())) {
                 for (int m = 0; m < (int)meshLibrary.size(); ++m) {
                     ImGui::PushID(m);
-                    if (ImGui::Selectable(meshLibrary[m].name.c_str(), t.meshId == m)) t.meshId = m;
+                    bool sel = (t.skinnedId < 0 && t.meshId == m);
+                    if (ImGui::Selectable(meshLibrary[m].name.c_str(), sel)) { t.meshId = m; t.skinnedId = -1; }
+                    ImGui::PopID();
+                }
+                for (int s = 0; s < (int)skinnedLibrary.size(); ++s) {
+                    ImGui::PushID(1000 + s);
+                    std::string label = "[anim] " + skinnedLibrary[s].name;
+                    if (ImGui::Selectable(label.c_str(), t.skinnedId == s)) { t.skinnedId = s; t.meshId = -1; }
                     ImGui::PopID();
                 }
                 ImGui::EndCombo();
+            }
+
+            // Animation clips by movement state (only for skinned NPCs that
+            // actually carry clips). -1 = "use idle".
+            if (t.skinnedId >= 0 && t.skinnedId < (int)skinnedLibrary.size()
+                && !skinnedLibrary[t.skinnedId].animations.empty()) {
+                const SkinnedMesh& sm = skinnedLibrary[t.skinnedId];
+                ImGui::SeparatorText("Animation states");
+                auto clipCombo = [&](const char* label, int& clip, bool allowNone) {
+                    std::string cur = (clip >= 0 && clip < (int)sm.animations.size())
+                                          ? sm.animations[clip].name : "(idle)";
+                    if (ImGui::BeginCombo(label, cur.c_str())) {
+                        if (allowNone && ImGui::Selectable("(idle)", clip < 0)) clip = -1;
+                        for (int a = 0; a < (int)sm.animations.size(); ++a) {
+                            ImGui::PushID(a);
+                            if (ImGui::Selectable(sm.animations[a].name.c_str(), clip == a)) clip = a;
+                            ImGui::PopID();
+                        }
+                        ImGui::EndCombo();
+                    }
+                };
+                clipCombo("Idle", t.clipIdle, false);
+                clipCombo("Walk", t.clipWalk, true);
+                clipCombo("Run",  t.clipRun,  true);
+                ImGui::DragFloat("Run at speed >=", &t.runSpeed, 0.1f, 0.0f, 20.0f);
             }
 
             ImGui::SeparatorText("Attributes");
@@ -1630,9 +954,11 @@ int main() {
 
             ImGui::Separator();
             if (ImGui::Button("Place NPC in world")) {
+                snapshot();
                 SceneObject o;
                 o.name = t.name;
-                o.meshId = t.meshId;
+                o.meshId = t.skinnedId >= 0 ? -1 : t.meshId;
+                o.skinnedId = t.skinnedId;
                 o.npcTemplate = selectedTemplate;
                 o.color = glm::vec3(1.0f);
                 scene.push_back(o);
@@ -1677,12 +1003,49 @@ int main() {
                 }
                 prevPlayF11 = f11;
 
+                // --- Free-fly camera: WASD/QE move, hold RMB to mouselook.
+                // Raw GLFW input (the play window has no ImGui context). Gated
+                // on focus so editor typing never drives the game camera.
+                bool focused = glfwGetWindowAttrib(playWindow, GLFW_FOCUSED) != 0;
+                bool rmb = focused && glfwGetMouseButton(playWindow, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+                if (rmb && !playLooking) {
+                    playLooking = true;
+                    glfwGetCursorPos(playWindow, &playLastMouseX, &playLastMouseY);
+                    glfwSetInputMode(playWindow, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+                } else if (playLooking && !rmb) {
+                    playLooking = false;
+                    glfwSetInputMode(playWindow, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+                }
+                if (playLooking) {
+                    double mx, my; glfwGetCursorPos(playWindow, &mx, &my);
+                    gameCam.yaw   += (float)(mx - playLastMouseX) * 0.0025f;
+                    gameCam.pitch -= (float)(my - playLastMouseY) * 0.0025f;   // invert Y
+                    gameCam.pitch  = glm::clamp(gameCam.pitch, -1.54f, 1.54f);
+                    playLastMouseX = mx; playLastMouseY = my;
+                }
+                glm::vec3 gf  = forwardFromYawPitch(gameCam.yaw, gameCam.pitch);
+                glm::vec3 grt = glm::normalize(glm::cross(gf, glm::vec3(0, 1, 0)));
+                glm::vec3 gwup(0, 1, 0);
+                if (focused) {
+                    float v = gameCam.flySpeed * dt;
+                    if (glfwGetKey(playWindow, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS) v *= 3.0f;
+                    if (glfwGetKey(playWindow, GLFW_KEY_W) == GLFW_PRESS) gameCam.flyPos += gf  * v;
+                    if (glfwGetKey(playWindow, GLFW_KEY_S) == GLFW_PRESS) gameCam.flyPos -= gf  * v;
+                    if (glfwGetKey(playWindow, GLFW_KEY_D) == GLFW_PRESS) gameCam.flyPos += grt * v;
+                    if (glfwGetKey(playWindow, GLFW_KEY_A) == GLFW_PRESS) gameCam.flyPos -= grt * v;
+                    if (glfwGetKey(playWindow, GLFW_KEY_E) == GLFW_PRESS) gameCam.flyPos += gwup * v;
+                    if (glfwGetKey(playWindow, GLFW_KEY_Q) == GLFW_PRESS) gameCam.flyPos -= gwup * v;
+                }
+                gameCam.eye    = gameCam.flyPos;
+                gameCam.target = gameCam.flyPos + gf;
+
                 int gw, gh;
                 glfwGetFramebufferSize(playWindow, &gw, &gh);
                 float gAspect = gh == 0 ? 1.0f : (float)gw / (float)gh;
                 glm::mat4 gView = viewMatrix(gameCam);
                 glm::mat4 gProj = projMatrix(gameCam, gAspect);
-                syncMeshes(playRenderer, meshLibrary);   // upload meshes into the play context
+                syncMeshes(playRenderer, meshLibrary);       // upload meshes into the play context
+                syncSkinned(playRenderer, skinnedLibrary);   // ...and skinned meshes
                 std::vector<glm::mat4> playModels;
                 std::vector<glm::vec3> playColors;
                 std::vector<int>       playMeshIds;
@@ -1692,9 +1055,29 @@ int main() {
                 for (const SceneObject& o : scene) {
                     playModels.push_back(o.transform);
                     playColors.push_back(o.color);
-                    playMeshIds.push_back(o.meshId);
+                    playMeshIds.push_back(o.skinnedId >= 0 ? -1 : o.meshId);
                 }
-                renderScene(0, gw, gh, gameCam, gView, gProj, playRenderer, env, false, true, playModels, playColors, playMeshIds, -1, gridSize);
+                std::vector<SkinnedDrawItem>        playSkins;
+                std::vector<std::vector<glm::mat4>> playPalettes;
+                playPalettes.reserve(scene.size());
+                for (int i = 0; i < (int)scene.size(); ++i) {
+                    const SceneObject& o = scene[i];
+                    if (o.skinnedId < 0 || o.skinnedId >= (int)skinnedLibrary.size()) continue;
+                    const SkinnedMesh& sm = skinnedLibrary[o.skinnedId];
+                    playPalettes.emplace_back();
+                    if (!sm.animations.empty()) {
+                        int ci = glm::clamp(o.animClip, 0, (int)sm.animations.size() - 1);
+                        computeBoneMatrices(sm, sm.animations[ci], animClock, playPalettes.back());
+                    } else {
+                        computeBoneMatrices(sm, Animation{}, 0.0f, playPalettes.back());
+                    }
+                    SkinnedDrawItem it;
+                    it.skinnedId = o.skinnedId; it.sceneIndex = i;
+                    it.model = o.transform; it.color = o.color;
+                    playSkins.push_back(it);
+                }
+                for (size_t k = 0; k < playSkins.size(); ++k) playSkins[k].palette = &playPalettes[k];
+                renderScene(0, gw, gh, gameCam, gView, gProj, playRenderer, env, false, true, playModels, playColors, playMeshIds, -1, gridSize, playSkins);
                 glfwSwapBuffers(playWindow);
             }
         }

@@ -118,7 +118,21 @@ target_include_directories(imgui PUBLIC
 target_link_libraries(imgui PUBLIC glfw)
 
 # --- Our executable -------------------------------------------------------
-add_executable(Foundation src/main.cpp src/platform_file.cpp src/stb_impl.cpp)
+add_executable(Foundation
+    src/main.cpp
+    src/shaders.cpp
+    src/mesh.cpp
+    src/skinned.cpp
+    src/camera.cpp
+    src/environment.cpp
+    src/scene.cpp
+    src/renderer.cpp
+    src/editor.cpp
+    src/navigation.cpp
+    src/npc_sim.cpp
+    src/platform_file.cpp
+    src/stb_impl.cpp
+)
 target_include_directories(Foundation PRIVATE ${stb_SOURCE_DIR})
 
 target_link_libraries(Foundation PRIVATE
