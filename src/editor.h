@@ -10,6 +10,7 @@
 #include "renderer.h"
 #include "scene.h"
 #include "skinned.h"
+#include "terrain.h"
 
 #include <vector>
 
@@ -37,4 +38,5 @@ bool drawViewportPanel(const char* name, RenderTarget& rt, const Camera& cam,
                        const std::vector<int>& meshIds,
                        int selectedIndex, float gridSpacing,
                        const std::vector<SkinnedDrawItem>& skins = {},
-                       EditContext* edit = nullptr);
+                       EditContext* edit = nullptr,
+                       Terrain* terrain = nullptr, TerrainBrush* brush = nullptr);

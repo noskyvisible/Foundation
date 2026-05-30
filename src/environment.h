@@ -1,6 +1,8 @@
 #pragma once
 #include <glm/glm.hpp>
 
+#include "weather.h"
+
 // ---- Environment: game clock + day/night sky + sun-driven light ----------
 struct Environment {
     // Authored / controllable state.
@@ -10,8 +12,17 @@ struct Environment {
                                   // (short for testing; UI slider goes to 3600)
     bool  running     = true;
     // Sky controls.
-    float cloudCover  = 0.4f;     // 0 clear .. 1 overcast (drives fBm clouds)
-    float exposure    = 1.0f;     // sky tonemap exposure
+    float cloudCover  = 0.4f;     // 0 clear .. 1 overcast (driven by weather)
+    float exposure    = 1.0f;     // user's base sky tonemap exposure
+    float skyExposure = 1.0f;     // derived: exposure * weather dimming (sent to shader)
+    // Exponential height fog (always on; weather adds to the density). Thickest at
+    // ground level, thinning with altitude, integrated along the view ray.
+    float fogDensity  = 0.0225f;  // clear-day fog thickness at ground level (weather adds)
+    float fogFalloff  = 0.035f;   // how fast fog thins with height (bigger = hugs ground)
+    glm::vec3 fogTint {0.74f, 0.78f, 0.86f};  // user-picked daytime fog colour
+    glm::vec3 fogColor{0.74f, 0.78f, 0.86f};  // derived: fogTint darkened at night / warmed at dusk
+    // Weather: drives cloudCover + sky mood; eases between states over time.
+    Weather weather;
     // Derived each frame from timeOfDay.
     glm::vec3 sunDir     {0, 1, 0};   // direction TO the sun
     glm::vec3 moonDir    {0,-1, 0};   // direction TO the moon (opposite the sun)

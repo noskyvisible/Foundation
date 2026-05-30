@@ -12,6 +12,12 @@ extern const char* kLitFS;
 extern const char* kSkinVS;
 extern const char* kSkyVS;
 extern const char* kSkyFS;
+extern const char* kGroundVS;    // camera-centered textured ground plane
+extern const char* kGroundFS;
+extern const char* kTerrainVS;   // heightmap terrain (splat-blended, lit, fogged)
+extern const char* kTerrainFS;
+extern const char* kRainVS;      // world-space instanced rain streaks
+extern const char* kRainFS;
 
 // Compile a single shader stage; logs errors to stderr. Returns the shader id.
 GLuint compileShader(GLenum type, const char* src);

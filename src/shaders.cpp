@@ -34,10 +34,13 @@ uniform mat4 uMVP;
 uniform mat4 uModel;
 out vec3 vNormal;
 out vec2 vUv;
+out vec3 vWorld;
 void main() {
+    vec4 world = uModel * vec4(aPos, 1.0);
     gl_Position = uMVP * vec4(aPos, 1.0);
     vNormal = transpose(inverse(mat3(uModel))) * aNormal;  // correct under scale
     vUv = aUv;
+    vWorld = world.xyz;
 }
 )glsl";
 
@@ -45,19 +48,39 @@ const char* kLitFS = R"glsl(
 #version 330 core
 in vec3 vNormal;
 in vec2 vUv;
+in vec3 vWorld;
 uniform vec3 uColor;
 uniform sampler2D uAlbedo;
 uniform int uHasTexture;
 uniform vec3 uLightDir;     // direction TO the sun (normalized)
 uniform vec3 uLightColor;   // sun colour * intensity (dims at night)
 uniform vec3 uAmbient;      // sky ambient (dim blue at night, never black)
+uniform vec3 uCamPos;       // for distance fog
+uniform vec3 uFogColor;     // weather haze colour
+uniform float uFogDensity;  // fog thickness at ground level
+uniform float uFogFalloff;  // how fast fog thins with height
 out vec4 FragColor;
+// Exponential height fog: density rho(y) = D * exp(-k*y), analytically integrated
+// along the camera->fragment ray. Thick low, thin high; more fog with distance.
+float heightFog(vec3 c, vec3 w, float D, float k) {
+    vec3 v = w - c;
+    float dist = length(v);
+    if (dist < 1e-4) return 0.0;
+    float ry = v.y / dist;
+    float baseD = D * exp(-k * c.y);
+    float kry = k * ry;
+    float od = (abs(kry) > 1e-5) ? baseD * (1.0 - exp(-kry * dist)) / kry
+                                 : baseD * dist;
+    return 1.0 - exp(-max(od, 0.0));
+}
 void main() {
     vec3 n = normalize(vNormal);
     float diff = max(dot(n, normalize(uLightDir)), 0.0);
     vec3 base = uColor;
     if (uHasTexture == 1) base *= texture(uAlbedo, vUv).rgb;
-    FragColor = vec4(base * (uAmbient + uLightColor * diff), 1.0);
+    vec3 lit = base * (uAmbient + uLightColor * diff);
+    float fog = heightFog(uCamPos, vWorld, uFogDensity, uFogFalloff);
+    FragColor = vec4(mix(lit, uFogColor, fog), 1.0);
 }
 )glsl";
 
@@ -77,6 +100,7 @@ const int MAX_BONES = 64;
 uniform mat4 uBones[MAX_BONES];
 out vec3 vNormal;
 out vec2 vUv;
+out vec3 vWorld;
 void main() {
     mat4 skin = aWeights.x * uBones[aBoneIds.x] + aWeights.y * uBones[aBoneIds.y]
               + aWeights.z * uBones[aBoneIds.z] + aWeights.w * uBones[aBoneIds.w];
@@ -84,6 +108,125 @@ void main() {
     gl_Position = uMVP * sp;
     vNormal = mat3(uModel) * mat3(skin) * aNormal;   // approx; good enough for lighting
     vUv = aUv;
+    vWorld = vec3(uModel * sp);
+}
+)glsl";
+
+// Ground plane: a large quad recentred on the camera each frame (so it always
+// reaches the horizon), textured in world space and fogged so its far edge melts
+// into the haze rather than showing a hard boundary.
+const char* kGroundVS = R"glsl(
+#version 330 core
+layout (location = 0) in vec2 aCorner;   // [-1,1] quad corner
+uniform mat4  uViewProj;
+uniform vec3  uCamPos;
+uniform float uHalfSize;
+out vec3 vWorld;
+void main() {
+    vec3 w = vec3(uCamPos.x + aCorner.x * uHalfSize, -0.5, uCamPos.z + aCorner.y * uHalfSize);
+    vWorld = w;
+    gl_Position = uViewProj * vec4(w, 1.0);
+}
+)glsl";
+
+const char* kGroundFS = R"glsl(
+#version 330 core
+in vec3 vWorld;
+uniform vec3  uCamPos;
+uniform vec3  uLightDir;
+uniform vec3  uLightColor;
+uniform vec3  uAmbient;
+uniform sampler2D uAlbedo;
+uniform float uUvScale;
+uniform vec3  uFogColor;
+uniform float uFogDensity;
+uniform float uFogFalloff;
+out vec4 FragColor;
+// Exponential height fog (same model as the lit shader).
+float heightFog(vec3 c, vec3 w, float D, float k) {
+    vec3 v = w - c;
+    float dist = length(v);
+    if (dist < 1e-4) return 0.0;
+    float ry = v.y / dist;
+    float baseD = D * exp(-k * c.y);
+    float kry = k * ry;
+    float od = (abs(kry) > 1e-5) ? baseD * (1.0 - exp(-kry * dist)) / kry
+                                 : baseD * dist;
+    return 1.0 - exp(-max(od, 0.0));
+}
+void main() {
+    vec3 n = vec3(0.0, 1.0, 0.0);
+    float diff = max(dot(n, normalize(uLightDir)), 0.0);
+    vec3 tex = texture(uAlbedo, vWorld.xz * uUvScale).rgb;   // world-anchored tiling
+    vec3 lit = tex * (uAmbient + uLightColor * diff);
+    float fog = heightFog(uCamPos, vWorld, uFogDensity, uFogFalloff);
+    FragColor = vec4(mix(lit, uFogColor, fog), 1.0);
+}
+)glsl";
+
+// Heightmap terrain: a world-space grid mesh. The splatmap (RGBA layer weights)
+// blends four tiling textures (sand/dirt/rock/4th) by world XZ, lit by the sun
+// and fogged with the same exponential height fog as the rest of the scene.
+const char* kTerrainVS = R"glsl(
+#version 330 core
+layout (location = 0) in vec3 aPos;     // already in world space
+layout (location = 1) in vec3 aNormal;
+layout (location = 2) in vec2 aUv;       // 0..1 across the terrain (splatmap)
+uniform mat4 uViewProj;
+out vec3 vNormal;
+out vec2 vUv;
+out vec3 vWorld;
+void main() {
+    vWorld  = aPos;
+    vNormal = aNormal;
+    vUv     = aUv;
+    gl_Position = uViewProj * vec4(aPos, 1.0);
+}
+)glsl";
+
+const char* kTerrainFS = R"glsl(
+#version 330 core
+in vec3 vNormal;
+in vec2 vUv;
+in vec3 vWorld;
+uniform vec3  uLightDir;
+uniform vec3  uLightColor;
+uniform vec3  uAmbient;
+uniform sampler2D uSplat;                // RGBA layer weights
+uniform sampler2D uTex0;                 // sand
+uniform sampler2D uTex1;                 // dirt
+uniform sampler2D uTex2;                 // rock
+uniform sampler2D uTex3;                 // 4th
+uniform float uTileScale;
+uniform vec3  uCamPos;
+uniform vec3  uFogColor;
+uniform float uFogDensity;
+uniform float uFogFalloff;
+out vec4 FragColor;
+float heightFog(vec3 c, vec3 w, float D, float k) {
+    vec3 v = w - c;
+    float dist = length(v);
+    if (dist < 1e-4) return 0.0;
+    float ry = v.y / dist;
+    float baseD = D * exp(-k * c.y);
+    float kry = k * ry;
+    float od = (abs(kry) > 1e-5) ? baseD * (1.0 - exp(-kry * dist)) / kry
+                                 : baseD * dist;
+    return 1.0 - exp(-max(od, 0.0));
+}
+void main() {
+    vec4 w = texture(uSplat, vUv);
+    vec2 tuv = vWorld.xz * uTileScale;
+    vec3 col = texture(uTex0, tuv).rgb * w.r
+             + texture(uTex1, tuv).rgb * w.g
+             + texture(uTex2, tuv).rgb * w.b
+             + texture(uTex3, tuv).rgb * w.a;
+    col /= max(w.r + w.g + w.b + w.a, 0.001);    // normalise so weights<1 don't darken
+    vec3 n = normalize(vNormal);
+    float diff = max(dot(n, normalize(uLightDir)), 0.0);
+    vec3 lit = col * (uAmbient + uLightColor * diff);
+    float fog = heightFog(uCamPos, vWorld, uFogDensity, uFogFalloff);
+    FragColor = vec4(mix(lit, uFogColor, fog), 1.0);
 }
 )glsl";
 
@@ -113,6 +256,11 @@ uniform vec3  uMoonDir;      // direction TO the moon (reserved: stars/moon phas
 uniform float uTime;         // wind/anim clock (reserved: clouds phase)
 uniform float uCloudCover;   // 0..1 (reserved: clouds phase)
 uniform float uExposure;
+uniform vec3  uHazeColor;    // weather haze tint (matches the ground fog colour)
+uniform float uHaze;         // 0..1 horizon haze strength (fog/storm murk)
+uniform float uLightning;    // current flash brightness (0 = none)
+uniform float uBoltAz;       // world azimuth of the lightning bolt
+uniform float uBoltSeed;     // jagged-shape seed for the bolt
 out vec4 FragColor;
 
 const float PI = 3.141592653589793;
@@ -267,7 +415,7 @@ float cloudShape(vec3 pos) {
     float vProfile = smoothstep(0.0, 0.18, hN) * smoothstep(1.0, 0.55, hN);
     vec2  q = cloudCoord(pos);
     float cover = clamp(uCloudCover, 0.0, 1.0);
-    float thr   = mix(0.50, 0.05, cover);
+    float thr   = mix(0.66, 0.04, cover);   // high at low cover -> clear skies clear
     float base  = fbm(q * 0.7);
     return smoothstep(thr, thr + 0.20, base) * vProfile;
 }
@@ -293,7 +441,7 @@ float cloudShapeLite(vec3 pos) {
     float v = 0.0, amp = 0.5; vec2 p = q * 0.7;
     for (int i = 0; i < 3; ++i) { v += amp * vnoise(p); p = M2 * p; amp *= 0.5; }
     float cover = clamp(uCloudCover, 0.0, 1.0);
-    float thr   = mix(0.50, 0.05, cover);
+    float thr   = mix(0.66, 0.04, cover);   // high at low cover -> clear skies clear
     return smoothstep(thr, thr + 0.20, v) * vProfile;
 }
 
@@ -395,6 +543,40 @@ vec3 moon(vec3 dir, vec3 moonDir) {
     return (disc * 1.2 + glow) * vec3(0.90, 0.92, 1.0);
 }
 
+// ---- lightning bolt ------------------------------------------------------
+float boltHash(float x) { return fract(sin(x * 127.1) * 43758.5453); }
+// Piecewise-smooth zigzag: random value per integer step, interpolated.
+float boltZig(float t, float seed) {
+    float i = floor(t), f = fract(t);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(boltHash(i + seed) * 2.0 - 1.0, boltHash(i + 1.0 + seed) * 2.0 - 1.0, f);
+}
+// A jagged, forked bolt at world azimuth az0, running from the horizon up. Works
+// in azimuth/elevation so it's anchored in the world (stays put as you turn).
+float lightningBolt(vec3 dir, float az0, float seed) {
+    float el = asin(clamp(dir.y, -1.0, 1.0));
+    if (el < 0.0) return 0.0;
+    float vert = smoothstep(0.0, 0.05, el) * smoothstep(1.15, 0.65, el);
+    if (vert <= 0.0) return 0.0;
+    float az = atan(dir.x, dir.z);
+    // Main channel: azimuth zigzags down the bolt, with a slight lean. Widths are
+    // in radians of azimuth -- kept small so the bolt is a thin filament + a faint
+    // narrow glow, not a fat luminous column.
+    float mAz = az0 + boltZig(el * 7.0 + seed, seed) * 0.035 + el * 0.05;
+    float dm  = abs(az - mAz); dm = min(dm, 6.2831853 - dm);
+    // Squared-Lorentzian falloff: a thin hot core that fades smoothly with no hard
+    // edge (a soft glowing filament, not a solid cut-out strip).
+    float w   = 0.0026;
+    float chan = (w * w) / (dm * dm + w * w);
+    // One fork peeling off the lower half.
+    float fEl  = 0.5;
+    float fAz  = az0 + boltZig(el * 6.0 + seed + 9.0, seed + 9.0) * 0.06 + (fEl - el) * 0.30;
+    float df   = abs(az - fAz); df = min(df, 6.2831853 - df);
+    float wf   = 0.0020;
+    float fork = (wf * wf) / (df * df + wf * wf) * smoothstep(fEl + 0.05, fEl - 0.35, el);
+    return (chan + fork) * vert;
+}
+
 void main() {
     vec4 far = uInvViewProj * vec4(vNdc, 1.0, 1.0);
     vec3 dir = normalize(far.xyz / far.w - uCamPos);
@@ -429,10 +611,110 @@ void main() {
     cl.rgb = mix(cl.rgb, sky * cl.a, aerial);
     col = col * (1.0 - cl.a) + cl.rgb;
 
+    // Lightning bolt: a brief, bright jagged fork during the flash. Added in HDR
+    // so the core tonemaps to white with a soft glow around it.
+    if (uLightning > 0.01) {
+        float bv = smoothstep(0.35, 0.7, uLightning);   // only on the bright peak
+        col += lightningBolt(dir, uBoltAz, uBoltSeed) * bv * vec3(0.90, 0.95, 1.0) * 5.0;
+    }
+
     // Tonemap + gamma.
     col = vec3(1.0) - exp(-col * uExposure);
     col = pow(col, vec3(1.0 / 2.2));
+
+    // Horizon haze: blend the sky toward the weather haze colour near the horizon
+    // so distance fog is unified with the ground (storms read as murky top to
+    // bottom, and the ground edge always melts into the sky). Applied in display
+    // space so it matches the (un-tonemapped) object/ground fog colour.
+    float hz = uHaze * (1.0 - smoothstep(0.0, 0.32, max(dir.y, 0.0)));
+    col = mix(col, uHazeColor, hz);
     FragColor = vec4(col, 1.0);
+}
+)glsl";
+
+// World-space rain particles. A static instance buffer holds random drop
+// positions inside a local box; the vertex shader animates the fall (and wraps
+// it) entirely on the GPU, so there's no per-frame CPU work. The box follows the
+// camera, so rain always surrounds the viewer; because the streaks live at real
+// world positions they parallax correctly as you look around (unlike a
+// screen-space overlay). Each instance is a 4-vertex quad expanded in clip space
+// into a thin, camera-facing ribbon along the drop's fall direction.
+const char* kRainVS = R"glsl(
+#version 330 core
+layout(location = 0) in vec2 aCorner;   // x: side -1..1, y: along 0..1
+layout(location = 1) in vec3 aBase;     // per-instance base position in the local box
+uniform mat4  uViewProj;
+uniform vec3  uCamPos;
+uniform vec3  uRainDisp;     // accumulated world displacement (integrated on the CPU)
+uniform vec3  uRainDir;      // current normalized rain velocity (streak orientation)
+uniform vec3  uBox;          // halfX, height, halfZ
+uniform float uStreakLen;    // world length of a streak
+uniform float uStreakWidth;  // world half-width
+out vec2 vUv;
+out float vFade;
+void main() {
+    float H = uBox.y;
+    // Per-drop pseudo-random: vary speed / length / angle so drops don't fall in
+    // rigid lockstep (which reads as a sliding sheet of "bands") and aren't all
+    // perfectly parallel.
+    float r1 = fract(sin(dot(aBase.xz, vec2(12.9898, 78.233))) * 43758.5453);
+    float r2 = fract(sin(dot(aBase.zx, vec2(39.346, 11.135))) * 24634.6334);
+    float dropMul = 0.70 + 0.60 * r1;                        // per-drop speed
+    float len     = uStreakLen * (0.55 + 0.90 * r2);
+    // World-anchored, wind-drifting columns. The drop's xz drifts with the wind
+    // (uRainDisp.xz) in WORLD space, then snaps to the tile nearest the camera, so
+    // it stays fixed in the world as you move -- you walk THROUGH the rain instead
+    // of dragging it along. It only jumps a whole tile when you cross a half-cell,
+    // which happens out at the faded box edge, so the recycle is invisible. The
+    // integrated displacement keeps the motion smooth through weather transitions.
+    float R = uBox.x;
+    float cell = 2.0 * R;
+    vec2 base  = aBase.xz + uRainDisp.xz * dropMul;
+    vec2 colXZ = base + cell * vec2(round((uCamPos.x - base.x) / cell),
+                                    round((uCamPos.z - base.y) / cell));
+    // Vertical fall (smooth, wrapped) in a band that follows the camera height so
+    // rain always surrounds you vertically.
+    float fall = mod(aBase.y + uRainDisp.y * dropMul, H);
+    vec3 center = vec3(colXZ.x, uCamPos.y + fall - H * 0.5, colXZ.y);
+    vec3 dir = uRainDir;                                     // streak orientation = travel dir
+    // Distance opacity: fade far drops out before the box edge (depth + hides the
+    // boundary, including the wrap) and gently fade ones right on top of the camera.
+    float dist = length(center - uCamPos);
+    // Cull drops right on top of the camera: their streak would straddle the near
+    // clip plane, where perspective interpolation goes NaN and smears a bright line
+    // across the screen. They're faded to nothing anyway, so just drop them.
+    if (dist < 1.5) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); vUv = vec2(0.0); vFade = 0.0; return; }
+    vFade = (1.0 - smoothstep(uBox.x * 0.45, uBox.x * 0.97, dist)) * smoothstep(0.4, 2.5, dist);
+    // World-space velocity-stretched billboard. The streak is a real line segment
+    // in the world, lying ALONG the drop's travel direction -- like a laser moving
+    // in one fixed world direction. Its orientation is fixed in the world, so it
+    // does NOT change when the camera rotates: you just view that same 3D streak
+    // from a different angle. The width faces the camera (perpendicular to the
+    // streak and the view ray), and the segment is centred on the drop.
+    vec3 toCam = uCamPos - center;
+    vec3 c = cross(dir, toCam);
+    vec3 side = (length(c) > 1e-4) ? normalize(c) : normalize(cross(dir, vec3(1.0, 0.0, 0.0)));
+    vec3 wpos = center + dir * (len * (aCorner.y - 0.5)) + side * (uStreakWidth * aCorner.x);
+    gl_Position = uViewProj * vec4(wpos, 1.0);
+    vUv = aCorner;
+}
+)glsl";
+
+const char* kRainFS = R"glsl(
+#version 330 core
+in vec2 vUv;             // x: -1..1 across width, y: 0..1 along streak
+in float vFade;          // distance opacity (far/near drops fade)
+uniform vec3  uColor;
+uniform float uIntensity;
+out vec4 FragColor;
+void main() {
+    float across = 1.0 - abs(vUv.x);                                   // soft edges
+    float along  = smoothstep(0.0, 0.25, vUv.y) * smoothstep(1.0, 0.55, vUv.y);
+    // Drops stay crisp; the drawn count conveys how heavy it is. Only fade out
+    // when the spell is nearly dry so easing in/out doesn't pop.
+    float fade = clamp(uIntensity * 4.0, 0.0, 1.0);
+    float a = across * along * 0.6 * fade * vFade;
+    FragColor = vec4(uColor, a);
 }
 )glsl";
 

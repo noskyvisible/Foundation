@@ -125,6 +125,8 @@ add_executable(Foundation
     src/skinned.cpp
     src/camera.cpp
     src/environment.cpp
+    src/weather.cpp
+    src/terrain.cpp
     src/scene.cpp
     src/renderer.cpp
     src/editor.cpp

@@ -33,10 +33,12 @@
 #include "renderer.h"
 #include "scene.h"
 #include "skinned.h"
+#include "terrain.h"
 
 #include "platform_file.h"    // native file-open dialog
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -71,6 +73,7 @@ int main() {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;   // enable dockable panels
+    io.ConfigDragClickToInputText = true;               // click a drag field to type a value
     // Don't load/save imgui.ini while we're still changing the panel set: a
     // stale layout file silently overrides our DockBuilder default and leaves
     // newly-renamed panels floating/collapsed. Build a fresh layout each launch.
@@ -97,6 +100,15 @@ int main() {
     float gridSize    = 1.0f;   // grid spacing AND translate snap increment
 
     Environment env;            // game clock + day/night sky + sun light
+    // Seed the weather RNG from the clock so the sequence differs every run
+    // (otherwise the fixed seed replays the identical weather pattern each launch).
+    env.weather.rng = (unsigned)std::chrono::high_resolution_clock::now()
+                          .time_since_epoch().count() | 1u;   // | 1: xorshift needs nonzero
+
+    Terrain terrain;            // heightmap landscape (single level-sized block)
+    initTerrain(terrain);       // starts flat at y=0; sculpt up from here
+    TerrainBrush terrainBrush;  // sculpt brush state (Terrain panel + viewport drag)
+    bool terrainTabActive = false;  // true only when the Terrain dock tab is visible
 
     // Mesh library: asset #0 is the built-in cube; loaded models append. Each
     // Renderer uploads these into its own GL context lazily (syncMeshes).
@@ -302,6 +314,7 @@ int main() {
         ImGui::DockBuilderDockWindow("Outliner", outlinerId);
         ImGui::DockBuilderDockWindow("Controls", controlsId);
         ImGui::DockBuilderDockWindow("Environment", controlsId);   // tabbed with Controls
+        ImGui::DockBuilderDockWindow("Terrain", controlsId);       // tabbed with Controls
         ImGui::DockBuilderDockWindow("Properties", rightId);
         ImGui::DockBuilderDockWindow("NPC Editor", rightId);   // tabbed with Properties
         if (layoutSingle) {
@@ -449,6 +462,7 @@ int main() {
         float  dt  = (float)(now - lastTime);
         lastTime   = now;
         animClock += dt;                                     // skinned preview always plays
+        updateWeather(env.weather, dt, playWindow != nullptr); // auto-cycle only in play
         updateEnvironment(env, dt, playWindow != nullptr);   // clock ticks only in play mode
 
         // Layer 3: scheduled NPC simulation (play mode only). Walks placed NPCs
@@ -568,6 +582,7 @@ int main() {
 
         syncMeshes(renderer, meshLibrary);       // upload any newly-loaded meshes (editor context)
         syncSkinned(renderer, skinnedLibrary);   // ...and skinned meshes
+        syncTerrain(renderer, terrain);          // ...and the terrain (re-uploads on edit)
         std::vector<glm::mat4> editorModels;
         std::vector<glm::vec3> editorColors;
         std::vector<int>       editorMeshIds;
@@ -618,7 +633,7 @@ int main() {
         int hoveredView = -1;
         auto drawView = [&](int i) -> bool {
             switch (i) {
-                case 0: return drawViewportPanel("Perspective", rtPersp, camPersp, renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize, editorSkins, &edit);
+                case 0: return drawViewportPanel("Perspective", rtPersp, camPersp, renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize, editorSkins, &edit, &terrain, terrainTabActive ? &terrainBrush : nullptr);
                 case 1: return drawViewportPanel("Top",   rtTop,   camTop,   renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize, editorSkins);
                 case 2: return drawViewportPanel("Front", rtFront, camFront, renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize, editorSkins);
                 default:return drawViewportPanel("Right", rtRight, camRight, renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize, editorSkins);
@@ -735,19 +750,76 @@ int main() {
         int mm = (int)((env.timeOfDay - hh) * 60.0f);
         ImGui::Text("Day %d   %02d:%02d", env.day, hh, mm);
         ImGui::SetNextItemWidth(-1.0f);
-        ImGui::SliderFloat("##time", &env.timeOfDay, 0.0f, 24.0f, "%.2f h");
+        ImGui::DragFloat("##time", &env.timeOfDay, 0.05f, 0.0f, 24.0f, "%.2f h");
         ImGui::Checkbox("Clock runs in Play", &env.running);
         ImGui::SetNextItemWidth(120.0f);
-        ImGui::SliderFloat("Day length (s)", &env.dayLengthSec, 10.0f, 3600.0f, "%.0f");
+        ImGui::DragFloat("Day length (s)", &env.dayLengthSec, 5.0f, 10.0f, 3600.0f, "%.0f");
         ImGui::TextDisabled("Real seconds per full 24h day.");
 
+        ImGui::SeparatorText("Weather");
+        Weather& wx = env.weather;
+        ImGui::Text("Now: %s", weatherName(wx.current));
+        ImGui::Checkbox("Auto weather", &wx.autoCycle);
+        if (wx.autoCycle) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(next ~%.0fs)", wx.dwellTimer);
+        }
+        // Manual selection: clicking forces a state. The active one is highlighted.
+        const WeatherType kTypes[kWeatherCount] = {
+            WeatherType::Clear, WeatherType::Fair, WeatherType::Overcast,
+            WeatherType::Rain, WeatherType::Thunderstorm };
+        for (int i = 0; i < kWeatherCount; ++i) {
+            if (i && i != 3) ImGui::SameLine();   // Clear/Fair/Overcast | Rain/Storm
+            bool active = wx.current == kTypes[i];
+            if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.45f, 0.78f, 1.0f));
+            if (ImGui::Button(weatherName(kTypes[i]))) {
+                wx.current = kTypes[i];
+                wx.dwellTimer = 60.0f;   // grace period before auto-cycle moves on
+            }
+            if (active) ImGui::PopStyleColor();
+        }
+        ImGui::DragFloat("Transition", &wx.blendSpeed, 0.02f, 0.1f, 2.0f, "%.2f /s");
+        ImGui::TextDisabled("Cloud cover %.2f  -  wind %.2f", env.cloudCover, wx.wind);
+
         ImGui::SeparatorText("Sky");
-        ImGui::SliderFloat("Cloud cover", &env.cloudCover, 0.0f, 1.0f, "%.2f");
-        ImGui::SliderFloat("Exposure",    &env.exposure,   0.2f, 3.0f, "%.2f");
+        ImGui::DragFloat("Exposure", &env.exposure, 0.01f, 0.2f, 3.0f, "%.2f");
         ImGui::TextDisabled("Physically-based atmosphere; clouds drift on their own.");
+
+        ImGui::SeparatorText("Height fog");
+        ImGui::ColorEdit3("Fog tint", &env.fogTint.x);
+        ImGui::DragFloat("Fog density", &env.fogDensity, 0.0005f, 0.0f, 0.08f, "%.4f");
+        ImGui::DragFloat("Fog falloff", &env.fogFalloff, 0.002f, 0.005f, 0.3f, "%.3f");
+        ImGui::TextDisabled("Exponential height fog: thick low, thins with altitude. Tint is the daytime colour (darkens at night). Weather adds density.");
 
         ImGui::Separator();
         ImGui::TextWrapped("Time only advances in Play mode (F5). In the editor, drag the time slider to preview the sky. NPC schedules use this clock.");
+        ImGui::End();
+
+        // --- Terrain: heightmap sculpt tools ---
+        // Begin() returns false when this is a background dock tab; the brush only
+        // works (and the cursor only shows) while the Terrain tab is the visible one.
+        terrainTabActive = ImGui::Begin("Terrain");
+        if (terrainTabActive) {
+            ImGui::Checkbox("Edit terrain (sculpt)", &terrainBrush.active);
+            ImGui::TextDisabled("In the Perspective view, drag Left-mouse to sculpt.");
+            ImGui::SeparatorText("Brush");
+            int toolIdx = (int)terrainBrush.tool;
+            const char* tools[] = { "Raise", "Lower", "Smooth", "Flatten" };
+            for (int i = 0; i < 4; ++i) {
+                if (i) ImGui::SameLine();
+                if (ImGui::RadioButton(tools[i], toolIdx == i)) toolIdx = i;
+            }
+            terrainBrush.tool = (TerrainTool)toolIdx;
+            ImGui::DragFloat("Radius",   &terrainBrush.radius,   0.5f, 2.0f, 80.0f, "%.1f");
+            ImGui::DragFloat("Strength", &terrainBrush.strength, 0.5f, 1.0f, 60.0f, "%.1f");
+            ImGui::SeparatorText("Whole terrain");
+            if (ImGui::Button("Flatten all")) {
+                std::fill(terrain.height.begin(), terrain.height.end(), 0.0f);
+                terrain.version++;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Reseed dunes")) seedDunes(terrain, 14.0f);
+        }
         ImGui::End();
 
         // --- Properties: inspector for the selected object (right side) ---
@@ -930,12 +1002,21 @@ int main() {
             if (removeC >= 0) t.custom.erase(t.custom.begin() + removeC);
             if (ImGui::Button("Add attribute")) t.custom.push_back({"attribute", 0.0f});
 
-            ImGui::SeparatorText("Schedule (hour / activity / location)");
+            ImGui::SeparatorText("Schedule (time / activity / location)");
             int removeS = -1;
             for (int e = 0; e < (int)t.schedule.size(); ++e) {
                 ImGui::PushID(3000 + e);
                 ScheduleEntry& se = t.schedule[e];
-                ImGui::SetNextItemWidth(64); ImGui::DragFloat("##hr", &se.hour, 0.25f, 0.0f, 24.0f, "%.2f");
+                // HH:MM editor: schedule time is stored as a decimal hour, but
+                // authored as separate hour/minute fields so e.g. 10:30 works.
+                int sh = (int)se.hour;
+                int sm = (int)((se.hour - (float)sh) * 60.0f + 0.5f);
+                if (sm >= 60) { sm = 0; sh = (sh + 1) % 24; }
+                bool tch = false;
+                ImGui::SetNextItemWidth(32); tch |= ImGui::DragInt("##hr", &sh, 0.1f, 0, 23, "%02d");
+                ImGui::SameLine(0.0f, 3.0f); ImGui::TextUnformatted(":"); ImGui::SameLine(0.0f, 3.0f);
+                ImGui::SetNextItemWidth(32); tch |= ImGui::DragInt("##min", &sm, 0.5f, 0, 59, "%02d");
+                if (tch) se.hour = (float)sh + (float)sm / 60.0f;
                 ImGui::SameLine(); ImGui::SetNextItemWidth(80); ImGui::InputText("##act", &se.activity);
                 ImGui::SameLine(); ImGui::SetNextItemWidth(90);
                 if (ImGui::BeginCombo("##loc", se.location.empty() ? "(where)" : se.location.c_str())) {
@@ -1046,6 +1127,7 @@ int main() {
                 glm::mat4 gProj = projMatrix(gameCam, gAspect);
                 syncMeshes(playRenderer, meshLibrary);       // upload meshes into the play context
                 syncSkinned(playRenderer, skinnedLibrary);   // ...and skinned meshes
+                syncTerrain(playRenderer, terrain);          // ...and the terrain
                 std::vector<glm::mat4> playModels;
                 std::vector<glm::vec3> playColors;
                 std::vector<int>       playMeshIds;

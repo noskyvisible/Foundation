@@ -10,7 +10,8 @@ bool drawViewportPanel(const char* name, RenderTarget& rt, const Camera& cam,
                        const std::vector<int>& meshIds,
                        int selectedIndex, float gridSpacing,
                        const std::vector<SkinnedDrawItem>& skins,
-                       EditContext* edit) {
+                       EditContext* edit,
+                       Terrain* terrain, TerrainBrush* brush) {
     bool imageHovered = false;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::Begin(name);
@@ -33,7 +34,54 @@ bool drawViewportPanel(const char* name, RenderTarget& rt, const Camera& cam,
         ImDrawList* dl = ImGui::GetWindowDrawList();
         dl->AddText(ImVec2(p0.x + 6, p0.y + 4), IM_COL32(210, 210, 220, 255), cam.label);
 
-        if (edit && edit->scene && edit->selected) {
+        // Terrain sculpting (perspective view, brush active): show a brush cursor
+        // ring draped on the terrain under the mouse, and on LMB-drag apply the
+        // brush. Takes over from object picking/selection while active.
+        bool sculpting = (brush && brush->active && terrain && cam.type == Projection::Perspective);
+        if (sculpting && imageHovered && !ImGuizmo::IsOver() && !ImGuizmo::IsUsing()) {
+            ImVec2 m = ImGui::GetIO().MousePos;
+            float nx = 2.0f * (m.x - p0.x) / (float)w - 1.0f;
+            float ny = 1.0f - 2.0f * (m.y - p0.y) / (float)h;
+            glm::mat4 invVP = glm::inverse(proj * view);
+            glm::vec4 pn = invVP * glm::vec4(nx, ny, -1.0f, 1.0f); pn /= pn.w;
+            glm::vec4 pf = invVP * glm::vec4(nx, ny,  1.0f, 1.0f); pf /= pf.w;
+            glm::vec3 ro = glm::vec3(pn);
+            glm::vec3 rd = glm::normalize(glm::vec3(pf) - glm::vec3(pn));
+            glm::vec3 hit;
+            if (raycastTerrain(*terrain, ro, rd, hit)) {
+                // Project a world point to viewport pixels (image V is flipped).
+                auto toScreen = [&](glm::vec3 wp, ImVec2& out) -> bool {
+                    glm::vec4 c = proj * view * glm::vec4(wp, 1.0f);
+                    if (c.w <= 1e-4f) return false;
+                    out = ImVec2(p0.x + (c.x / c.w * 0.5f + 0.5f) * (float)w,
+                                 p0.y + (1.0f - (c.y / c.w * 0.5f + 0.5f)) * (float)h);
+                    return true;
+                };
+                // Brush ring, draped on the heightfield so size + location read true.
+                const int SEG = 48;
+                ImVec2 prev; bool havePrev = false;
+                ImU32 col = IM_COL32(255, 220, 80, 220);
+                for (int s = 0; s <= SEG; ++s) {
+                    float a = (float)s / SEG * 6.2831853f;
+                    float px = hit.x + cosf(a) * brush->radius;
+                    float pz = hit.z + sinf(a) * brush->radius;
+                    float py = terrain->heightAt(px, pz) + 0.1f;
+                    ImVec2 sp;
+                    if (toScreen(glm::vec3(px, py, pz), sp)) {
+                        if (havePrev) dl->AddLine(prev, sp, col, 2.0f);
+                        prev = sp; havePrev = true;
+                    } else havePrev = false;
+                }
+                ImVec2 cc;
+                if (toScreen(hit + glm::vec3(0.0f, 0.1f, 0.0f), cc))
+                    dl->AddCircleFilled(cc, 3.5f, col);
+
+                if (ImGui::IsMouseDown(ImGuiMouseButton_Left))
+                    applyTerrainBrush(*terrain, hit, *brush, ImGui::GetIO().DeltaTime);
+            }
+        }
+
+        if (edit && edit->scene && edit->selected && !sculpting) {
             std::vector<SceneObject>& scene = *edit->scene;
             int sel = *edit->selected;
             // Gizmo for the selected object, clipped to this viewport's rect.
