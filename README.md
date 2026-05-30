@@ -6,6 +6,20 @@ skeletal-animation import, scripted NPCs with pathfinding, a dynamic day/night
 sky with weather, and a sculptable heightmap terrain — all built on a GL 3.3
 core renderer with no engine middleware.
 
+## Download & run (Windows)
+
+Grab the latest prebuilt build from the
+[**Releases**](https://github.com/noskyvisible/Foundation/releases/latest) page —
+no build tools required:
+
+1. Download `Foundation-vX.Y.Z-win64.zip` and extract it.
+2. Open the extracted `Foundation/` folder and double-click **`Foundation.exe`**.
+
+The executable is statically linked (it uses only standard Windows system
+libraries), so there's nothing to install — just keep `Foundation.exe` next to
+the `materials/` and `models/` folders it ships with. To build from source
+instead, see [Building](#building-windows--mingw).
+
 ## Features
 
 ### Editor
