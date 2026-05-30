@@ -1,32 +1,62 @@
 # Foundation
 
-A small C++/OpenGL scene editor — a Hammer/Unity-style quad-view editor with a
-separate play window, gizmos, an outliner/inspector, and GLB/FBX model loading.
+A from-scratch **C++/OpenGL game engine** with a Hammer/Unity-style editor:
+quad-view editing and a separate play window, transform gizmos, model and
+skeletal-animation import, scripted NPCs with pathfinding, a dynamic day/night
+sky with weather, and a sculptable heightmap terrain — all built on a GL 3.3
+core renderer with no engine middleware.
 
 ## Features
 
-- **Quad-view editor** — Perspective + Top/Front/Side orthographic viewports,
-  each rendered to its own framebuffer; maximize one to fill the area (Space)
-  or show the 2x2 grid.
-- **Hammer-style visuals** — reference grid, wireframe ortho views / solid 3D,
-  per-view labels, dark theme.
-- **Play mode** — F5 opens a separate, fullscreen-able (F11) game window with
-  its own GL context running a game camera; the editor stays static.
-- **Gizmos** (ImGuizmo) — translate / rotate / scale (W/E/R), world/local,
-  click-to-select with ray picking, an orange selection box.
-- **Snap to grid** with an adjustable grid size (drives both the visible grid
-  and the snap increment).
-- **Scene model** — an outliner (add/delete/select objects) and a properties
-  inspector (name, numeric transform, material colour).
-- **Undo/redo** (Ctrl+Z / Ctrl+Y) and **copy/paste** (Ctrl+C / Ctrl+V).
-- **Save / load** scenes to a plain-text `.fdn` file (Ctrl+S).
-- **Cameras** — mouse-wheel zoom in any view; Unreal-style fly in Perspective
-  (hold right mouse: WASD move, E/Q up/down, wheel = speed).
-- **Lighting + materials** — directional light over surface normals, per-object
-  colour.
-- **Mesh loading** — import GLB / GLTF / FBX / OBJ via Assimp, with embedded
-  base-colour textures (decoded with stb_image). Loads at the origin and is
-  editable like any other object.
+### Editor
+- **Quad-view** — Perspective + Top/Front/Side orthographic viewports, each
+  rendered to its own framebuffer; maximize one (Space) or show the 2×2 grid.
+- **Play mode** — `F5` opens a separate, fullscreen-able (`F11`) game window with
+  its own GL context and a free-fly game camera; the editor keeps running.
+- **Gizmos** (ImGuizmo) — translate / rotate / scale (`W`/`E`/`R`), world/local,
+  click-to-select via ray picking, an orange selection box.
+- **Snap to grid** with an adjustable grid size (drives the grid *and* the snap).
+- **Outliner + inspector** — add/delete/select objects; edit name, transform,
+  material colour, and (for NPCs) attributes and schedule.
+- **Undo/redo** (`Ctrl+Z`/`Ctrl+Y`), **copy/paste** (`Ctrl+C`/`Ctrl+V`), and
+  **save/load** scenes to a plain-text `.fdn` file (`Ctrl+S`).
+- **Cameras** — wheel zoom in any view; Unreal-style fly in Perspective.
+
+### Models & animation
+- **Mesh import** — GLB / GLTF / FBX / OBJ via Assimp, with embedded base-colour
+  textures (decoded with stb_image).
+- **Skinned meshes** — GPU skinning with a per-frame bone palette; **skeletal
+  animation** clips selected by movement state (idle / walk / run).
+
+### NPCs & navigation
+- **NPC templates** — attributes and needs (health/hunger/thirst/energy with
+  per-hour rates), plus a daily **schedule** (HH:MM → activity → location).
+- **Grid A\*** pathfinding; in play mode NPCs walk/run to their scheduled targets
+  on the game clock, with the animation clip driven by their speed.
+
+### Environment & sky
+- **Game clock** with an adjustable day length and a full day/night cycle.
+- **Physically-based atmosphere** — Rayleigh + Mie single-scattering raymarched
+  per pixel (blue day, warm sunrise/sunset, dark night).
+- **Volumetric clouds** — raymarched, wind-drifted, domain-warped with altitude
+  variation; **night stars + moon**; sun-driven directional light + ambient.
+
+### Weather
+- States **Clear / Fair / Overcast / Rain / Thunderstorm** with smoothly-eased
+  transitions and a natural, mean-reverting **auto-cycle** (or manual override).
+- **World-anchored instanced rain** you actually move through (not glued to the
+  camera), with per-drop variation, distance fade, and wind-driven slant.
+- **Forked lightning** rendered procedurally in the sky during storms, plus a
+  scene-lighting flash.
+- **Exponential height fog** with a colour picker (darkens at night, warms at
+  dawn/dusk) and density that scales with the weather; a matching sky horizon
+  haze keeps ground and sky blended.
+
+### Terrain
+- Level-sized **heightmap** landscape with a **multi-texture splat blend**
+  (sand / dirt / rock), lit and fogged like the rest of the scene.
+- In-editor **sculpt brushes** — raise / lower / smooth / flatten — driven by a
+  ray cast into the heightfield, with a brush cursor draped on the terrain.
 
 ## Dependencies
 
@@ -64,19 +94,30 @@ cmake --build build
 | Maximize / restore the hovered view | `Space` |
 | Fly (Perspective) | Hold **right mouse**: `WASD`, `E`/`Q` up/down, wheel = speed |
 | Zoom a view | Mouse wheel |
+| Sculpt terrain | **Terrain** tab → *Edit terrain*, then drag **left mouse** in Perspective |
 | Undo / Redo | `Ctrl+Z` / `Ctrl+Y` |
 | Copy / Paste | `Ctrl+C` / `Ctrl+V` |
 | Save scene | `Ctrl+S` |
 | Play / Stop | `F5` (in play window: `F11` fullscreen, `Esc` stop) |
 
-Use **Load Mesh (GLB/FBX)** in the Outliner to import a model; put source assets
-in `models/` and textures in `materials/`.
+Panels: **Outliner** (objects), **Controls / Environment / Terrain** (tabbed —
+gizmo & grid, sky/weather/fog, terrain brushes), **Properties** and **NPC
+Editor**. Import models with **Load Mesh** in the Outliner; put source models in
+`models/` and textures in `materials/`.
 
 ## Layout
 
 ```
-src/            engine + editor source (main.cpp, platform_file, stb impl)
-models/         model files (.glb/.fbx/.obj)
-materials/      textures
-CMakeLists.txt  build + dependency fetch
+src/
+  main.cpp                window/ImGui setup + per-frame loop
+  camera / environment    view + projection; game clock, day/night, lighting
+  weather / terrain       weather state machine; heightmap + sculpt + splat
+  mesh / skinned / scene  static + skinned model loading; scene model + save/load
+  navigation / npc_sim    grid A* pathfinding; scheduled NPC simulation
+  renderer / shaders      GL 3.3 renderer; sky/cloud/rain/terrain/fog shaders
+  editor                  dockable viewport panel (gizmos, picking, brushes)
+  platform_file / stb_impl native file dialog; stb_image implementation
+models/                   model files (.glb/.fbx/.obj)
+materials/                terrain + object textures
+CMakeLists.txt            build + dependency fetch
 ```
