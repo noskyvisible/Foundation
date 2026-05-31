@@ -14,6 +14,25 @@ static float hash01(int i) {
     return s - std::floor(s);
 }
 
+// Per-NPC xorshift PRNG (avoids global rand(); deterministic from the seed).
+static float frand(unsigned& s) {
+    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+    return (s & 0xFFFFFF) / (float)0x1000000;   // [0,1)
+}
+
+const char* npcStateName(NPCState s) {
+    switch (s) {
+        case NPCState::Idle:   return "Idle";
+        case NPCState::Wander: return "Wander";
+        case NPCState::Work:   return "Work";
+        case NPCState::Eat:    return "Eat";
+        case NPCState::Drink:  return "Drink";
+        case NPCState::Sleep:  return "Sleep";
+        case NPCState::Goto:   return "Goto";
+    }
+    return "?";
+}
+
 // Hours wrapped into [0, 24).
 static float mod24(float h) {
     float r = std::fmod(h, 24.0f);
@@ -137,16 +156,36 @@ void seedNPCs(std::vector<NPCRuntime>& out,
         if (n.scale.y <= 0.0f) n.scale.y = 1.0f;
         if (n.scale.z <= 0.0f) n.scale.z = 1.0f;
 
-        n.leadHours = 0.5f + hash01(i) * 1.0f;   // 0.5 .. 1.5 game-hours early
+        // Preserve the authored facing: the model's forward is +Z (after importFix),
+        // so the placed yaw is atan2 of the transform's Z basis. Without this the NPC
+        // would snap to a fixed direction on Play, ignoring how it was rotated.
+        n.facing = std::atan2(o.transform[2].x, o.transform[2].z);
+
+        // Depart only ~15 game-minutes before the scheduled hour (small per-NPC
+        // jitter so they don't all set off on the same frame). Until then the NPC
+        // keeps doing its current activity instead of leaving an hour early.
+        n.leadHours = 0.20f + hash01(i) * 0.10f;  // ~12-18 game-min (about 15)
         n.targetName.clear();
+        n.state       = NPCState::Idle;
+        n.decideTimer = hash01(i) * 0.4f;         // stagger the first decision
+        n.hasGoal     = false;
+        n.pauseTimer  = 0.0f;
+        n.rng         = (unsigned)(i * 2654435761u) | 1u;   // non-zero seed
         out.push_back(n);
     }
 }
 
 // ---- per-frame simulation -------------------------------------------------
 
-// Pick the schedule entry the NPC should be acting on right now: the upcoming
-// entry if it's within lead time, otherwise the most recently passed one.
+// Pick the schedule entry the NPC should be acting on right now:
+//   * the upcoming entry, but only once it's within the (short) lead window — so
+//     the NPC sets off ~15 min before, not hours early;
+//   * otherwise the entry that is genuinely *ongoing* — the most recently passed
+//     one, but only if it started within the last 12h. This guards the
+//     wrap-around trap: a lone 10:00 entry, seen at 09:00, has elapsed≈23h and
+//     would otherwise masquerade as the "current" activity, making the NPC leave
+//     an hour early. Beyond that there is no appointment (free time) and the NPC
+//     waits / wanders until its next entry's lead window opens.
 static const ScheduleEntry* pickGoal(const NPCTemplate& t, float now, float lead) {
     if (t.schedule.empty()) return nullptr;
     int    activeIdx = -1; float bestElapsed = 1e30f;
@@ -157,9 +196,111 @@ static const ScheduleEntry* pickGoal(const NPCTemplate& t, float now, float lead
         if (elapsed < bestElapsed) { bestElapsed = elapsed; activeIdx = e; }
         if (until   < bestUntil)   { bestUntil   = until;   upIdx     = e; }
     }
-    if (upIdx >= 0 && bestUntil <= lead) return &t.schedule[upIdx];
-    if (activeIdx >= 0)                  return &t.schedule[activeIdx];
+    if (upIdx >= 0 && bestUntil <= lead)        return &t.schedule[upIdx];
+    if (activeIdx >= 0 && bestElapsed <= 12.0f) return &t.schedule[activeIdx];
     return nullptr;
+}
+
+// ---- behaviour arbiter (utility-lite FSM) --------------------------------
+
+struct StateChoice { NPCState state; std::string loc; float score; };
+
+// Need pressure: 0 above 60, ramping to 1.0 at empty. Drives Eat/Drink/Sleep.
+static float needUrgency(float need) {
+    return glm::clamp((60.0f - need) / 60.0f, 0.0f, 1.0f);
+}
+
+// First schedule location whose activity contains either keyword (lowercased).
+// This is how an NPC knows *where* to eat/sleep/work; the FSM decides *when*.
+static std::string schedLocFor(const NPCTemplate& t, const char* k1, const char* k2) {
+    for (const ScheduleEntry& se : t.schedule) {
+        if (se.location.empty()) continue;
+        std::string a = toLower(se.activity);
+        if (a.find(k1) != std::string::npos || (k2 && a.find(k2) != std::string::npos))
+            return se.location;
+    }
+    return {};
+}
+
+// Score every Townsfolk state and return the winner. Object-based states must
+// have a valid destination to win; Wander/Idle need none. Need-driven states
+// (Sleep/Eat/Drink) gain urgency as the matching need drops; Work wins during
+// scheduled work hours when no need is pressing. Transitions are emergent: the
+// NPC simply ends up in whichever state scores highest right now.
+static StateChoice decideTownsfolk(const NPCRuntime& n, const NPCTemplate& t, float now,
+                                   const std::string& foodLoc, const std::string& waterLoc) {
+    bool night = (now < 6.0f || now >= 21.0f);
+    const ScheduleEntry* g = pickGoal(t, now, n.leadHours);
+    std::string sa = g ? toLower(g->activity) : std::string();
+    auto saHas = [&](const char* k) { return sa.find(k) != std::string::npos; };
+
+    // Baseline: an NPC with a schedule WAITS in place between appointments (so it
+    // doesn't appear to set off early), while a free agent with no schedule strolls
+    // around for ambient life. Either is easily overridden below.
+    StateChoice best{ NPCState::Idle, std::string(), 0.05f };
+    if (t.schedule.empty() && 0.20f > best.score)
+        best = { NPCState::Wander, std::string(), 0.20f };
+
+    auto consider = [&](NPCState st, std::string loc, float score) {
+        if (loc.empty()) return;                 // object-based states need a place
+        if (score > best.score) best = { st, std::move(loc), score };
+    };
+
+    // (A) Scheduled appointment: attend the current/imminent entry's location.
+    //     pickGoal only hands one back while it's genuinely ongoing or within the
+    //     short lead window, so the NPC stays put until ~15 min before, then heads
+    //     over. The activity keyword picks the matching state (so Eat/Sleep/Drink
+    //     still restore their need); anything else is a generic Goto-and-wait.
+    if (g && !g->location.empty()) {
+        NPCState st = NPCState::Goto;
+        if      (saHas("sleep") || saHas("bed") || saHas("rest")) st = NPCState::Sleep;
+        else if (saHas("eat")   || saHas("food") || saHas("cook")) st = NPCState::Eat;
+        else if (saHas("drink") || saHas("water"))                st = NPCState::Drink;
+        else if (saHas("work"))                                   st = NPCState::Work;
+        consider(st, g->location, 0.45f);
+    }
+
+    // (B) Survival needs escalate and override the schedule when they get urgent
+    //     (emergent "leave work to eat/sleep"). Eat/Drink head for the nearest
+    //     food/water *source* if one exists, else a matching schedule location.
+    //     A "sticky" bonus keeps the NPC finishing a meal/drink/rest once started
+    //     (until ~85%) so it tops the need up instead of nibbling. Night nudges
+    //     sleep up a little.
+    float eu = needUrgency(n.energy), hu = needUrgency(n.hunger), tu = needUrgency(n.thirst);
+    auto sticky = [&](NPCState st, float need) { return (n.state == st && need < 85.0f) ? 0.60f : 0.0f; };
+
+    consider(NPCState::Sleep, schedLocFor(t, "sleep", "bed"),
+             std::max(eu + (night ? 0.30f : 0.0f), sticky(NPCState::Sleep, n.energy)));
+    consider(NPCState::Eat,   !foodLoc.empty()  ? foodLoc  : schedLocFor(t, "eat", "food"),
+             std::max(hu, sticky(NPCState::Eat, n.hunger)));
+    consider(NPCState::Drink, !waterLoc.empty() ? waterLoc : schedLocFor(t, "drink", "water"),
+             std::max(tu, sticky(NPCState::Drink, n.thirst)));
+    return best;
+}
+
+// Set the NPC's path to a world-XZ goal. Returns true if a path was found.
+static bool tryPathTo(const NavGrid& grid, NPCRuntime& n, glm::vec2 goal) {
+    std::vector<glm::vec2> path;
+    if (findPath(grid, glm::vec2(n.pos.x, n.pos.z), goal, path) && path.size() >= 1) {
+        n.path = std::move(path);
+        n.waypoint = (n.path.size() > 1) ? 1 : 0;   // skip the start cell
+        n.moving   = (n.waypoint < n.path.size());
+        n.goalXZ   = goal;
+        n.hasGoal  = true;
+        return true;
+    }
+    return false;
+}
+
+// Pick a random reachable point a short stroll away and path to it.
+static bool pickWanderGoal(const NavGrid& grid, NPCRuntime& n) {
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        float ang = frand(n.rng) * 6.2831853f;
+        float rad = 3.0f + frand(n.rng) * 7.0f;       // 3..10 units away
+        glm::vec2 goal(n.pos.x + std::cos(ang) * rad, n.pos.z + std::sin(ang) * rad);
+        if (tryPathTo(grid, n, goal)) return true;
+    }
+    return false;
 }
 
 void simulateNPCs(std::vector<NPCRuntime>& npcs,
@@ -167,6 +308,7 @@ void simulateNPCs(std::vector<NPCRuntime>& npcs,
                   const std::vector<NPCTemplate>& templates,
                   const NavGrid& grid,
                   const Environment& env,
+                  const Terrain& terrain,
                   float dt) {
     const float now = env.timeOfDay;
     // Game-hours elapsed this frame (needs only deplete while the clock runs).
@@ -178,31 +320,56 @@ void simulateNPCs(std::vector<NPCRuntime>& npcs,
         if (n.templateId < 0 || n.templateId >= (int)templates.size()) continue;
         const NPCTemplate& t = templates[n.templateId];
 
-        // 1) Decide where this NPC should be heading.
-        const ScheduleEntry* goal = pickGoal(t, now, n.leadHours);
-        std::string wantTarget = goal ? goal->location : std::string();
-        n.activity = goal ? goal->activity : std::string("idle");
-
-        // 2) (Re)plan a path when the target changes.
-        if (wantTarget != n.targetName) {
-            n.targetName = wantTarget;
-            n.path.clear();
-            n.waypoint = 0;
-            n.moving   = false;
-            int ti = findObjectByName(scene, wantTarget);
-            if (ti >= 0 && ti != n.sceneIndex) {
-                glm::vec3 gp = glm::vec3(scene[ti].transform[3]);
-                std::vector<glm::vec2> path;
-                if (findPath(grid, glm::vec2(n.pos.x, n.pos.z),
-                             glm::vec2(gp.x, gp.z), path) && path.size() >= 1) {
-                    n.path = std::move(path);
-                    n.waypoint = (n.path.size() > 1) ? 1 : 0;  // skip the start point
-                    n.moving = (n.waypoint < n.path.size());
-                }
-            }
+        // Nearest food/water source with portions left (so a no-schedule NPC can
+        // still find somewhere to eat/drink). Scanned each frame against the live
+        // scene so depleted sources drop out immediately.
+        std::string foodLoc, waterLoc;
+        float bestF = 1e30f, bestW = 1e30f;
+        for (const SceneObject& so : scene) {
+            if (so.portions <= 0) continue;
+            glm::vec3 sp = glm::vec3(so.transform[3]);
+            float d2 = (sp.x - n.pos.x) * (sp.x - n.pos.x) + (sp.z - n.pos.z) * (sp.z - n.pos.z);
+            if (so.resourceType == RES_FOOD  && d2 < bestF) { bestF = d2; foodLoc  = so.name; }
+            if (so.resourceType == RES_WATER && d2 < bestW) { bestW = d2; waterLoc = so.name; }
         }
 
-        // 3) Walk along the current path.
+        // 1) DECIDE: re-score the states on a throttle and adopt the winner.
+        //    Transitions are emergent — we just move to the highest scorer.
+        n.decideTimer -= dt;
+        if (n.decideTimer <= 0.0f) {
+            n.decideTimer = 0.4f;
+            StateChoice c = decideTownsfolk(n, t, now, foodLoc, waterLoc);
+            if (c.state != n.state) {
+                n.state      = c.state;
+                n.hasGoal    = false;       // new state wants a fresh goal
+                n.pauseTimer = 0.0f;
+            }
+            n.targetName = c.loc;           // "" for Wander/Idle
+            n.activity   = toLower(npcStateName(n.state));
+        }
+
+        // 2) GOAL: resolve the current state's destination and (re)path to it.
+        if (n.state == NPCState::Wander) {
+            if (n.pauseTimer > 0.0f) {          // dwell at the last stroll point
+                n.pauseTimer -= dt;
+                n.moving = false;
+            } else if (!n.hasGoal) {
+                if (!pickWanderGoal(grid, n)) n.pauseTimer = 0.8f;   // boxed in; wait
+            }
+        } else if (n.state == NPCState::Idle) {
+            n.moving = false; n.hasGoal = false;
+        } else {
+            int ti = findObjectByName(scene, n.targetName);
+            if (ti >= 0 && ti != n.sceneIndex) {
+                glm::vec3 gp = glm::vec3(scene[ti].transform[3]);
+                glm::vec2 g(gp.x, gp.z);
+                if (!n.hasGoal || glm::distance(g, n.goalXZ) > 0.5f) {
+                    if (!tryPathTo(grid, n, g)) { n.moving = false; n.hasGoal = false; }
+                }
+            } else { n.moving = false; n.hasGoal = false; }
+        }
+
+        // 3) Walk along the current path (shared locomotion layer).
         if (n.moving && n.waypoint < n.path.size()) {
             glm::vec2 tgt = n.path[n.waypoint];
             glm::vec2 cur(n.pos.x, n.pos.z);
@@ -221,22 +388,41 @@ void simulateNPCs(std::vector<NPCRuntime>& npcs,
             n.pos.x = cur.x; n.pos.z = cur.y;
         }
 
-        // 4) Needs deplete over game time; arriving at a restorative activity
-        //    refills the matching need.
+        // 4) Needs deplete over game time; the current state restores its need
+        //    once the NPC has arrived at (and is standing on) its goal.
         n.hunger -= t.attr.hungerRate * gameHours;
         n.thirst -= t.attr.thirstRate * gameHours;
         n.energy -= t.attr.energyRate * gameHours;
-        if (!n.moving && !n.targetName.empty()) {
-            std::string act = toLower(n.activity);
+        bool arrivedAtGoal = !n.moving && n.hasGoal;
+        if (arrivedAtGoal) {
             const float refill = 40.0f * gameHours;   // per game-hour
-            if (act.find("eat") != std::string::npos || act.find("food") != std::string::npos ||
-                act.find("cook") != std::string::npos)
-                n.hunger += refill;
-            if (act.find("drink") != std::string::npos || act.find("water") != std::string::npos)
-                n.thirst += refill;
-            if (act.find("sleep") != std::string::npos || act.find("rest") != std::string::npos ||
-                act.find("bed")   != std::string::npos)
-                n.energy += refill;
+            if (n.state == NPCState::Sleep) {
+                n.energy += refill;                   // resting anywhere restores energy
+            } else if (n.state == NPCState::Eat || n.state == NPCState::Drink) {
+                int ri = findObjectByName(scene, n.targetName);
+                int want = (n.state == NPCState::Eat) ? RES_FOOD : RES_WATER;
+                if (ri >= 0 && scene[ri].resourceType != RES_NONE) {
+                    // A consumable source: take one portion per visit, then feed
+                    // while standing here. An empty source provides nothing.
+                    SceneObject& src = scene[ri];
+                    if (src.resourceType == want && src.portions > 0) {
+                        if (n.consumingObj != ri) { src.portions -= 1; n.consumingObj = ri; }
+                        if (n.state == NPCState::Eat) n.hunger += refill; else n.thirst += refill;
+                    }
+                } else if (ri >= 0) {
+                    // A plain schedule location (no resource): refill as before.
+                    if (n.state == NPCState::Eat) n.hunger += refill; else n.thirst += refill;
+                }
+            }
+        }
+        // Release the portion claim once we stop eating/drinking or move on, so the
+        // next visit consumes a fresh portion.
+        if (n.moving || (n.state != NPCState::Eat && n.state != NPCState::Drink))
+            n.consumingObj = -1;
+        // Wander: reached the stroll point -> dwell a beat, then pick a new one.
+        if (n.state == NPCState::Wander && n.hasGoal && !n.moving) {
+            n.hasGoal    = false;
+            n.pauseTimer = 1.0f + frand(n.rng) * 2.0f;
         }
         // Health: starving/dehydrated/exhausted hurts; otherwise slowly recovers.
         if (n.hunger <= 0.0f || n.thirst <= 0.0f || n.energy <= 0.0f)
@@ -260,8 +446,10 @@ void simulateNPCs(std::vector<NPCRuntime>& npcs,
             so.animClip = clip;   // render clamps to the mesh's clip range
         }
 
-        // 6) Write position + facing back into the scene transform.
-        n.pos.y = n.baseY;
+        // 6) Write position + facing back into the scene transform. The NPC's feet
+        //    follow the terrain surface (like the FPS player), so it walks over the
+        //    dunes rather than floating at the authored ground height.
+        n.pos.y = terrain.enabled ? terrain.heightAt(n.pos.x, n.pos.z) : n.baseY;
         glm::mat4 m = glm::translate(glm::mat4(1.0f), n.pos);
         m = glm::rotate(m, n.facing, glm::vec3(0.0f, 1.0f, 0.0f));
         m = glm::scale(m, n.scale);

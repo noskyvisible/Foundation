@@ -71,6 +71,7 @@ int main() {
     // ---- ImGui setup ----
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
+    ImGuiContext* editorCtx = ImGui::GetCurrentContext();   // restored after the play overlay
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;   // enable dockable panels
     io.ConfigDragClickToInputText = true;               // click a drag field to type a value
@@ -109,6 +110,11 @@ int main() {
     initTerrain(terrain);       // starts flat at y=0; sculpt up from here
     TerrainBrush terrainBrush;  // sculpt brush state (Terrain panel + viewport drag)
     bool terrainTabActive = false;  // true only when the Terrain dock tab is visible
+
+    PlayerStart player;             // FPS spawn point + controller tuning (editor marker + play)
+    glm::vec3 playerFeet{0.0f};     // FPS runtime: feet position in play
+    float playerVelY = 0.0f;        // vertical velocity (gravity/jump)
+    bool  playerGrounded = false;   // standing on the terrain this frame
 
     // Mesh library: asset #0 is the built-in cube; loaded models append. Each
     // Renderer uploads these into its own GL context lazily (syncMeshes).
@@ -189,6 +195,14 @@ int main() {
     const char* kScenePath = "scene.fdn";
     std::string sceneStatus;       // last save/load result, shown in Outliner
 
+    // Restore a previously-saved world (objects, libraries, NPC templates,
+    // environment, and terrain) over the default demo, if scene.fdn exists. CPU
+    // only here; the GPU upload happens via syncMeshes/syncTerrain in the loop.
+    if (loadScene(scene, meshLibrary, skinnedLibrary, npcTemplates, env, terrain, player, kScenePath)) {
+        selected = scene.empty() ? -1 : 0;
+        sceneStatus = "Loaded scene.fdn";
+    }
+
     // Play-mode state. Play opens a SEPARATE OS window with its own GL context
     // running the game; the editor stays static.
     GLFWwindow* playWindow   = nullptr;
@@ -200,6 +214,9 @@ int main() {
     NavGrid                  navGrid;
     bool        prevF5       = false;  // edge-detect the F5 toggle (editor window)
     bool        prevPlayF11  = false;  // edge-detect F11 (play window fullscreen)
+    bool        prevPlayTab  = false;  // edge-detect Tab (toggle the NPC debug overlay)
+    bool        playDebugOverlay = false;  // Tab in play: NPC stats/state/path overlay
+    ImGuiContext* playImguiCtx = nullptr;   // 2nd ImGui context, bound to the play window
     bool        playFullscreen = false;
     bool        playLooking  = false;  // RMB-held mouselook in the play window
     double      playLastMouseX = 0.0, playLastMouseY = 0.0;
@@ -225,6 +242,17 @@ int main() {
         glfwMakeContextCurrent(playWindow);
         glfwSwapInterval(1);
         playRenderer = createRenderer();
+        // Second ImGui context for the in-play debug overlay (Tab). Display-only:
+        // no input callbacks, no mouse, so it never fights the game's raw input or
+        // the captured mouselook cursor. GL objects live in the play context.
+        playImguiCtx = ImGui::CreateContext();
+        ImGui::SetCurrentContext(playImguiCtx);
+        ImGui::GetIO().IniFilename = nullptr;
+        ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NoMouse | ImGuiConfigFlags_NoMouseCursorChange;
+        ImGui::StyleColorsDark();
+        ImGui_ImplGlfw_InitForOpenGL(playWindow, false);
+        ImGui_ImplOpenGL3_Init("#version 330");
+        ImGui::SetCurrentContext(editorCtx);
         glfwMakeContextCurrent(window);   // restore editor context
         playFullscreen = false;
 
@@ -241,9 +269,28 @@ int main() {
         sceneBackup = scene;
         buildNavFromScene(navGrid, scene, npcTemplates, meshLibrary, skinnedLibrary);
         seedNPCs(npcRuntimes, scene, npcTemplates);
+
+        // FPS controller: spawn at the player start, snapped onto the terrain.
+        if (player.fps) {
+            playerFeet   = player.pos;
+            playerFeet.y = std::max(player.pos.y, terrain.heightAt(player.pos.x, player.pos.z));
+            gameCam.yaw  = player.yaw;
+            gameCam.pitch = 0.0f;
+            playerVelY = 0.0f;
+            playerGrounded = true;
+        }
     };
     auto closePlay = [&]() {
         glfwMakeContextCurrent(playWindow);
+        // Tear down the play overlay's ImGui context (its GL objects live here).
+        if (playImguiCtx) {
+            ImGui::SetCurrentContext(playImguiCtx);
+            ImGui_ImplOpenGL3_Shutdown();
+            ImGui_ImplGlfw_Shutdown();
+            ImGui::DestroyContext(playImguiCtx);
+            playImguiCtx = nullptr;
+            ImGui::SetCurrentContext(editorCtx);
+        }
         destroyRenderer(playRenderer);
         glfwMakeContextCurrent(window);
         glfwDestroyWindow(playWindow);
@@ -264,15 +311,21 @@ int main() {
 
     Camera camPersp;
     camPersp.type = Projection::Perspective;
-    camPersp.eye = {2.5f, 2.0f, 3.0f};
     camPersp.gridModel = toXZ;          // ground plane
     camPersp.label = "3D camera";
-    // Seed fly state so it initially looks at the origin.
+    // Open the perspective view at the player start — behind & above it, looking
+    // at the spawn — so the editor never starts buried under the terrain.
     {
+        glm::vec3 fwd = forwardFromYawPitch(player.yaw, 0.0f);
+        glm::vec3 eye = player.pos - fwd * 4.0f + glm::vec3(0.0f, 2.5f, 0.0f);
+        float clear = (terrain.enabled ? terrain.heightAt(eye.x, eye.z) : 0.0f) + 1.5f;
+        eye.y = std::max(eye.y, clear);
+        camPersp.eye    = eye;
+        camPersp.target = player.pos + glm::vec3(0.0f, 1.0f, 0.0f);
         camPersp.flyPos = camPersp.eye;
         glm::vec3 d0 = glm::normalize(camPersp.target - camPersp.eye);
         camPersp.yaw   = std::atan2(d0.x, -d0.z);
-        camPersp.pitch = std::asin(d0.y);
+        camPersp.pitch = std::asin(glm::clamp(d0.y, -1.0f, 1.0f));
     }
     bool flying = false;   // true while right-mouse fly is active in Perspective
 
@@ -356,12 +409,18 @@ int main() {
     auto doCopy = [&]() {
         if (selected >= 0 && selected < (int)scene.size()) { clipboard = scene[selected]; hasClipboard = true; }
     };
+    // Ground height at a world XZ, so newly-placed entities sit on the landscape
+    // instead of at y=0 (which can be buried under or floating above the terrain).
+    auto groundY = [&](float x, float z) {
+        return terrain.enabled ? terrain.heightAt(x, z) : 0.0f;
+    };
     auto doPaste = [&]() {
         if (!hasClipboard) return;
         snapshot();
         SceneObject o = clipboard;
         float off = gridSize > 0.0f ? gridSize : 1.0f;
         o.transform = glm::translate(glm::mat4(1.0f), glm::vec3(off, 0.0f, off)) * o.transform;
+        o.transform[3].y = groundY(o.transform[3].x, o.transform[3].z);   // re-ground the copy
         o.name += " copy";
         scene.push_back(o);
         selected = (int)scene.size() - 1;
@@ -374,8 +433,22 @@ int main() {
         };
         SceneObject o;
         o.name = "Cube " + std::to_string(scene.size());
-        o.transform = glm::translate(glm::mat4(1.0f), glm::vec3((float)scene.size() * 1.5f, 0.0f, 0.0f));
+        float cx = (float)scene.size() * 1.5f;
+        o.transform = glm::translate(glm::mat4(1.0f), glm::vec3(cx, groundY(cx, 0.0f), 0.0f));
         o.color = palette[scene.size() % 6];
+        scene.push_back(o);
+        selected = (int)scene.size() - 1;
+    };
+    // Place a consumable resource source (food or water). Uses the built-in cube
+    // mesh by default — pick a real mesh and set the portion count in Properties.
+    auto doAddResource = [&](int type) {
+        snapshot();
+        SceneObject o;
+        o.name = (type == RES_WATER ? "Water " : "Food ") + std::to_string(scene.size());
+        o.transform = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, groundY(0.0f, 0.0f), 0.0f));
+        o.color = (type == RES_WATER) ? glm::vec3(0.35f, 0.55f, 0.95f) : glm::vec3(0.85f, 0.6f, 0.3f);
+        o.resourceType = type;
+        o.portions = 10;
         scene.push_back(o);
         selected = (int)scene.size() - 1;
     };
@@ -386,22 +459,17 @@ int main() {
         if (selected >= (int)scene.size()) selected = (int)scene.size() - 1;
     };
     auto doSave = [&]() {
-        sceneStatus = saveScene(scene, meshLibrary, skinnedLibrary, kScenePath)
+        sceneStatus = saveScene(scene, meshLibrary, skinnedLibrary, npcTemplates, env, terrain, player, kScenePath)
                           ? "Saved scene.fdn" : "Save FAILED";
     };
     auto doLoad = [&]() {
-        std::vector<SceneObject> loaded;
-        std::vector<MeshAsset>   loadedMesh;
-        std::vector<SkinnedMesh> loadedSkin;
-        if (loadScene(loaded, loadedMesh, loadedSkin, kScenePath)) {
-            snapshot();
-            scene = std::move(loaded);
-            // v3 files rebuild the libraries; v2 leaves them empty (keep ours).
-            if (!loadedMesh.empty()) meshLibrary    = std::move(loadedMesh);
-            if (!loadedSkin.empty()) skinnedLibrary = std::move(loadedSkin);
+        // loadScene commits into these only on a fully successful parse, and leaves
+        // them untouched on failure, so it's safe to pass the live state directly.
+        snapshot();
+        if (loadScene(scene, meshLibrary, skinnedLibrary, npcTemplates, env, terrain, player, kScenePath)) {
             invalidateGPUMeshes(renderer);   // editor context is current here
-            selected = scene.empty() ? -1 : 0;
-            sceneStatus = "Loaded scene.fdn";
+            if (selected >= (int)scene.size()) selected = scene.empty() ? -1 : 0;
+            sceneStatus = "Loaded scene.fdn";   // terrain re-uploads via its bumped version
         } else sceneStatus = "Load FAILED (no scene.fdn?)";
     };
     auto doLoadMesh = [&]() {
@@ -415,6 +483,7 @@ int main() {
             o.name   = meshLibrary.back().name;
             o.meshId = (int)meshLibrary.size() - 1;
             o.color  = glm::vec3(1.0f);
+            o.transform = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, groundY(0.0f, 0.0f), 0.0f));
             scene.push_back(o);
             selected = (int)scene.size() - 1;
             sceneStatus = "Loaded " + o.name;
@@ -429,6 +498,7 @@ int main() {
         o.skinnedId = sid;
         o.meshId    = -1;
         o.color     = glm::vec3(1.0f);
+        o.transform = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, groundY(0.0f, 0.0f), 0.0f));
         scene.push_back(o);
         selected = (int)scene.size() - 1;
     };
@@ -468,7 +538,7 @@ int main() {
         // Layer 3: scheduled NPC simulation (play mode only). Walks placed NPCs
         // along A* paths to their scheduled locations and updates their needs.
         if (playWindow)
-            simulateNPCs(npcRuntimes, scene, npcTemplates, navGrid, env, dt);
+            simulateNPCs(npcRuntimes, scene, npcTemplates, navGrid, env, terrain, dt);
 
         // ---- Editor render (editor GL context) ----
         glfwMakeContextCurrent(window);
@@ -633,10 +703,10 @@ int main() {
         int hoveredView = -1;
         auto drawView = [&](int i) -> bool {
             switch (i) {
-                case 0: return drawViewportPanel("Perspective", rtPersp, camPersp, renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize, editorSkins, &edit, &terrain, terrainTabActive ? &terrainBrush : nullptr);
-                case 1: return drawViewportPanel("Top",   rtTop,   camTop,   renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize, editorSkins);
-                case 2: return drawViewportPanel("Front", rtFront, camFront, renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize, editorSkins);
-                default:return drawViewportPanel("Right", rtRight, camRight, renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize, editorSkins);
+                case 0: return drawViewportPanel("Perspective", rtPersp, camPersp, renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize, editorSkins, &edit, &terrain, terrainTabActive ? &terrainBrush : nullptr, &player);
+                case 1: return drawViewportPanel("Top",   rtTop,   camTop,   renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize, editorSkins, nullptr, nullptr, nullptr, &player);
+                case 2: return drawViewportPanel("Front", rtFront, camFront, renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize, editorSkins, nullptr, nullptr, nullptr, &player);
+                default:return drawViewportPanel("Right", rtRight, camRight, renderer, env, wireframe3D, showGrid, editorModels, editorColors, editorMeshIds, selected, gridSize, editorSkins, nullptr, nullptr, nullptr, &player);
             }
         };
         if (layoutSingle) {
@@ -704,7 +774,13 @@ int main() {
 
         // --- Outliner: scene object list + add/delete ---
         ImGui::Begin("Outliner");
-        if (ImGui::Button("Add Cube"))   doAddCube();
+        if (ImGui::Button("Add \xe2\x96\xbe")) ImGui::OpenPopup("addmenu");   // "Add ▾"
+        if (ImGui::BeginPopup("addmenu")) {
+            if (ImGui::Selectable("Cube"))         doAddCube();
+            if (ImGui::Selectable("Food source"))  doAddResource(RES_FOOD);
+            if (ImGui::Selectable("Water source")) doAddResource(RES_WATER);
+            ImGui::EndPopup();
+        }
         ImGui::SameLine();
         ImGui::BeginDisabled(selected < 0 || selected >= (int)scene.size());
         if (ImGui::Button("Delete"))     doDelete();
@@ -751,6 +827,17 @@ int main() {
         ImGui::Text("Day %d   %02d:%02d", env.day, hh, mm);
         ImGui::SetNextItemWidth(-1.0f);
         ImGui::DragFloat("##time", &env.timeOfDay, 0.05f, 0.0f, 24.0f, "%.2f h");
+        // Quick jumps for testing schedules (e.g. reset to 09:00 and watch an NPC
+        // wait, then set off ~15 min before its appointment).
+        struct TimeBtn { const char* label; float hour; };
+        static const TimeBtn timeBtns[] = {
+            {"00:00", 0.0f}, {"06:00", 6.0f}, {"09:00", 9.0f},
+            {"12:00", 12.0f}, {"18:00", 18.0f}, {"21:00", 21.0f},
+        };
+        for (int i = 0; i < 6; ++i) {
+            if (i) ImGui::SameLine();
+            if (ImGui::SmallButton(timeBtns[i].label)) { env.timeOfDay = timeBtns[i].hour; env.day = 0; }
+        }
         ImGui::Checkbox("Clock runs in Play", &env.running);
         ImGui::SetNextItemWidth(120.0f);
         ImGui::DragFloat("Day length (s)", &env.dayLengthSec, 5.0f, 10.0f, 3600.0f, "%.0f");
@@ -824,6 +911,34 @@ int main() {
 
         // --- Properties: inspector for the selected object (right side) ---
         ImGui::Begin("Properties");
+
+        // Player start + FPS controller settings (always shown at the top).
+        if (ImGui::CollapsingHeader("Player Start", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Checkbox("FPS mode in play", &player.fps);
+            ImGui::TextDisabled(player.fps ? "Play: WASD walk, Shift run, Space jump, mouse look."
+                                           : "Play: free-fly camera (RMB look).");
+            ImGui::DragFloat3("Spawn pos", &player.pos.x, 0.05f);
+            float yawDeg = glm::degrees(player.yaw);
+            if (ImGui::DragFloat("Spawn yaw", &yawDeg, 1.0f, -360.0f, 360.0f, "%.0f deg"))
+                player.yaw = glm::radians(yawDeg);
+            if (ImGui::Button("Set to camera")) {     // place at the perspective view
+                player.pos  = camPersp.flyPos;
+                player.pos.y = terrain.heightAt(player.pos.x, player.pos.z);
+                player.yaw  = camPersp.yaw;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Drop to terrain"))
+                player.pos.y = terrain.heightAt(player.pos.x, player.pos.z);
+            ImGui::SeparatorText("FPS controller");
+            ImGui::DragFloat("Eye height", &player.eyeHeight, 0.05f, 0.5f, 3.0f,  "%.2f m");
+            ImGui::DragFloat("Walk speed", &player.walkSpeed, 0.1f, 0.5f, 20.0f, "%.1f");
+            ImGui::DragFloat("Run speed",  &player.runSpeed,  0.1f, 0.5f, 30.0f, "%.1f");
+            ImGui::DragFloat("Jump speed", &player.jumpSpeed, 0.1f, 0.0f, 20.0f, "%.1f");
+            ImGui::DragFloat("Gravity",    &player.gravity,   0.5f, 0.0f, 60.0f, "%.1f");
+            ImGui::DragFloat("Mouse sens", &player.mouseSens, 0.0005f, 0.0005f, 0.02f, "%.4f");
+            ImGui::Separator();
+        }
+
         if (selected >= 0 && selected < (int)scene.size()) {
             SceneObject& o = scene[selected];
             bool propActivated = false;   // snapshot for undo on the first edit
@@ -848,6 +963,35 @@ int main() {
             ImGui::ColorEdit3("Color", glm::value_ptr(o.color));
             propActivated |= ImGui::IsItemActivated();
             ImGui::TextDisabled("Texture: drop files in materials/ (coming soon)");
+
+            // Mesh picker (static objects): choose which library mesh this draws.
+            if (o.skinnedId < 0 && !meshLibrary.empty()) {
+                ImGui::SeparatorText("Mesh");
+                o.meshId = glm::clamp(o.meshId, 0, (int)meshLibrary.size() - 1);
+                if (ImGui::BeginCombo("Mesh", meshLibrary[o.meshId].name.c_str())) {
+                    for (int mi = 0; mi < (int)meshLibrary.size(); ++mi) {
+                        ImGui::PushID(mi);
+                        if (ImGui::Selectable(meshLibrary[mi].name.c_str(), o.meshId == mi)) {
+                            o.meshId = mi; propActivated = true;
+                        }
+                        ImGui::PopID();
+                    }
+                    ImGui::EndCombo();
+                }
+            }
+
+            // Resource source: food/water that need-driven NPCs consume from.
+            if (o.npcTemplate < 0 && o.skinnedId < 0) {
+                ImGui::SeparatorText("Resource");
+                const char* kinds[] = { "None (prop)", "Food", "Water" };
+                int rt = o.resourceType;
+                if (ImGui::Combo("Type", &rt, kinds, 3)) { o.resourceType = rt; propActivated = true; }
+                if (o.resourceType != RES_NONE) {
+                    ImGui::DragInt("Portions", &o.portions, 0.2f, 0, 9999);
+                    propActivated |= ImGui::IsItemActivated();
+                    ImGui::TextDisabled("Each visit by a hungry/thirsty NPC drains one portion.");
+                }
+            }
 
             if (o.skinnedId >= 0 && o.skinnedId < (int)skinnedLibrary.size()) {
                 const SkinnedMesh& sm = skinnedLibrary[o.skinnedId];
@@ -880,12 +1024,14 @@ int main() {
                     ImGui::ProgressBar(rt->hunger / 100.0f, ImVec2(-FLT_MIN, 0), "Hunger");
                     ImGui::ProgressBar(rt->thirst / 100.0f, ImVec2(-FLT_MIN, 0), "Thirst");
                     ImGui::ProgressBar(rt->energy / 100.0f, ImVec2(-FLT_MIN, 0), "Energy");
-                    ImGui::Text("Activity: %s", rt->activity.c_str());
+                    ImGui::Text("AI state: %s", npcStateName(rt->state));
                     if (!rt->targetName.empty())
                         ImGui::Text("Heading to: %s%s", rt->targetName.c_str(),
                                     rt->moving ? " (walking)" : " (arrived)");
+                    else if (rt->state == NPCState::Wander)
+                        ImGui::TextDisabled(rt->moving ? "Wandering..." : "Pausing...");
                     else
-                        ImGui::TextDisabled("No scheduled target.");
+                        ImGui::TextDisabled("Idle.");
                 } else {
                     ImGui::TextDisabled("Press Play (F5) to simulate. Edit the type in the NPC Editor tab.");
                 }
@@ -1042,6 +1188,7 @@ int main() {
                 o.skinnedId = t.skinnedId;
                 o.npcTemplate = selectedTemplate;
                 o.color = glm::vec3(1.0f);
+                o.transform = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, groundY(0.0f, 0.0f), 0.0f));
                 scene.push_back(o);
                 selected = (int)scene.size() - 1;
             }
@@ -1084,38 +1231,87 @@ int main() {
                 }
                 prevPlayF11 = f11;
 
-                // --- Free-fly camera: WASD/QE move, hold RMB to mouselook.
-                // Raw GLFW input (the play window has no ImGui context). Gated
-                // on focus so editor typing never drives the game camera.
+                // Raw GLFW input (the play window has no ImGui context). Gated on
+                // focus so editor typing never drives the game camera.
                 bool focused = glfwGetWindowAttrib(playWindow, GLFW_FOCUSED) != 0;
-                bool rmb = focused && glfwGetMouseButton(playWindow, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
-                if (rmb && !playLooking) {
-                    playLooking = true;
-                    glfwGetCursorPos(playWindow, &playLastMouseX, &playLastMouseY);
-                    glfwSetInputMode(playWindow, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
-                } else if (playLooking && !rmb) {
-                    playLooking = false;
-                    glfwSetInputMode(playWindow, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
-                }
-                if (playLooking) {
-                    double mx, my; glfwGetCursorPos(playWindow, &mx, &my);
-                    gameCam.yaw   += (float)(mx - playLastMouseX) * 0.0025f;
-                    gameCam.pitch -= (float)(my - playLastMouseY) * 0.0025f;   // invert Y
-                    gameCam.pitch  = glm::clamp(gameCam.pitch, -1.54f, 1.54f);
-                    playLastMouseX = mx; playLastMouseY = my;
-                }
-                glm::vec3 gf  = forwardFromYawPitch(gameCam.yaw, gameCam.pitch);
-                glm::vec3 grt = glm::normalize(glm::cross(gf, glm::vec3(0, 1, 0)));
-                glm::vec3 gwup(0, 1, 0);
-                if (focused) {
-                    float v = gameCam.flySpeed * dt;
-                    if (glfwGetKey(playWindow, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS) v *= 3.0f;
-                    if (glfwGetKey(playWindow, GLFW_KEY_W) == GLFW_PRESS) gameCam.flyPos += gf  * v;
-                    if (glfwGetKey(playWindow, GLFW_KEY_S) == GLFW_PRESS) gameCam.flyPos -= gf  * v;
-                    if (glfwGetKey(playWindow, GLFW_KEY_D) == GLFW_PRESS) gameCam.flyPos += grt * v;
-                    if (glfwGetKey(playWindow, GLFW_KEY_A) == GLFW_PRESS) gameCam.flyPos -= grt * v;
-                    if (glfwGetKey(playWindow, GLFW_KEY_E) == GLFW_PRESS) gameCam.flyPos += gwup * v;
-                    if (glfwGetKey(playWindow, GLFW_KEY_Q) == GLFW_PRESS) gameCam.flyPos -= gwup * v;
+                bool shift   = focused && glfwGetKey(playWindow, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS;
+                // Tab toggles the NPC debug overlay (stats / state / path).
+                bool tabNow = focused && glfwGetKey(playWindow, GLFW_KEY_TAB) == GLFW_PRESS;
+                if (tabNow && !prevPlayTab) playDebugOverlay = !playDebugOverlay;
+                prevPlayTab = tabNow;
+                glm::vec3 gf;
+                if (player.fps) {
+                    // --- First-person controller: grounded WASD + sprint + jump,
+                    // gravity, and terrain collision. Mouse is captured while the
+                    // window is focused for continuous mouselook.
+                    if (focused && !playLooking) {
+                        playLooking = true;
+                        glfwGetCursorPos(playWindow, &playLastMouseX, &playLastMouseY);
+                        glfwSetInputMode(playWindow, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+                    } else if (!focused && playLooking) {
+                        playLooking = false;
+                        glfwSetInputMode(playWindow, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+                    }
+                    if (playLooking) {
+                        double mx, my; glfwGetCursorPos(playWindow, &mx, &my);
+                        gameCam.yaw   += (float)(mx - playLastMouseX) * player.mouseSens;
+                        gameCam.pitch -= (float)(my - playLastMouseY) * player.mouseSens;
+                        gameCam.pitch  = glm::clamp(gameCam.pitch, -1.54f, 1.54f);
+                        playLastMouseX = mx; playLastMouseY = my;
+                    }
+                    gf = forwardFromYawPitch(gameCam.yaw, gameCam.pitch);
+                    glm::vec3 hf = glm::vec3(gf.x, 0.0f, gf.z);
+                    hf = (glm::length(hf) > 1e-4f) ? glm::normalize(hf) : glm::vec3(0, 0, -1);
+                    glm::vec3 hr = glm::normalize(glm::cross(hf, glm::vec3(0, 1, 0)));
+                    if (focused) {
+                        glm::vec3 move(0.0f);
+                        if (glfwGetKey(playWindow, GLFW_KEY_W) == GLFW_PRESS) move += hf;
+                        if (glfwGetKey(playWindow, GLFW_KEY_S) == GLFW_PRESS) move -= hf;
+                        if (glfwGetKey(playWindow, GLFW_KEY_D) == GLFW_PRESS) move += hr;
+                        if (glfwGetKey(playWindow, GLFW_KEY_A) == GLFW_PRESS) move -= hr;
+                        if (glm::length(move) > 1e-4f) move = glm::normalize(move);
+                        playerFeet += move * ((shift ? player.runSpeed : player.walkSpeed) * dt);
+                        if (playerGrounded && glfwGetKey(playWindow, GLFW_KEY_SPACE) == GLFW_PRESS) {
+                            playerVelY = player.jumpSpeed; playerGrounded = false;
+                        }
+                    }
+                    // Gravity + terrain ground collision (feet stay on the surface).
+                    playerVelY -= player.gravity * dt;
+                    playerFeet.y += playerVelY * dt;
+                    float ground = terrain.heightAt(playerFeet.x, playerFeet.z);
+                    if (playerFeet.y <= ground) { playerFeet.y = ground; playerVelY = 0.0f; playerGrounded = true; }
+                    else playerGrounded = false;
+                    gameCam.flyPos = playerFeet + glm::vec3(0.0f, player.eyeHeight, 0.0f);
+                } else {
+                    // --- Free-fly camera: WASD/QE 6-DOF, hold RMB to mouselook.
+                    bool rmb = focused && glfwGetMouseButton(playWindow, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+                    if (rmb && !playLooking) {
+                        playLooking = true;
+                        glfwGetCursorPos(playWindow, &playLastMouseX, &playLastMouseY);
+                        glfwSetInputMode(playWindow, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+                    } else if (playLooking && !rmb) {
+                        playLooking = false;
+                        glfwSetInputMode(playWindow, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+                    }
+                    if (playLooking) {
+                        double mx, my; glfwGetCursorPos(playWindow, &mx, &my);
+                        gameCam.yaw   += (float)(mx - playLastMouseX) * 0.0025f;
+                        gameCam.pitch -= (float)(my - playLastMouseY) * 0.0025f;   // invert Y
+                        gameCam.pitch  = glm::clamp(gameCam.pitch, -1.54f, 1.54f);
+                        playLastMouseX = mx; playLastMouseY = my;
+                    }
+                    gf = forwardFromYawPitch(gameCam.yaw, gameCam.pitch);
+                    glm::vec3 grt = glm::normalize(glm::cross(gf, glm::vec3(0, 1, 0)));
+                    glm::vec3 gwup(0, 1, 0);
+                    if (focused) {
+                        float v = gameCam.flySpeed * dt * (shift ? 3.0f : 1.0f);
+                        if (glfwGetKey(playWindow, GLFW_KEY_W) == GLFW_PRESS) gameCam.flyPos += gf  * v;
+                        if (glfwGetKey(playWindow, GLFW_KEY_S) == GLFW_PRESS) gameCam.flyPos -= gf  * v;
+                        if (glfwGetKey(playWindow, GLFW_KEY_D) == GLFW_PRESS) gameCam.flyPos += grt * v;
+                        if (glfwGetKey(playWindow, GLFW_KEY_A) == GLFW_PRESS) gameCam.flyPos -= grt * v;
+                        if (glfwGetKey(playWindow, GLFW_KEY_E) == GLFW_PRESS) gameCam.flyPos += gwup * v;
+                        if (glfwGetKey(playWindow, GLFW_KEY_Q) == GLFW_PRESS) gameCam.flyPos -= gwup * v;
+                    }
                 }
                 gameCam.eye    = gameCam.flyPos;
                 gameCam.target = gameCam.flyPos + gf;
@@ -1160,6 +1356,102 @@ int main() {
                 }
                 for (size_t k = 0; k < playSkins.size(); ++k) playSkins[k].palette = &playPalettes[k];
                 renderScene(0, gw, gh, gameCam, gView, gProj, playRenderer, env, false, true, playModels, playColors, playMeshIds, -1, gridSize, playSkins);
+
+                // --- NPC debug overlay (Tab): stats + AI state + path, drawn with
+                //     the play window's own ImGui context over the rendered scene. ---
+                if (playDebugOverlay && playImguiCtx) {
+                    int ww, wh; glfwGetWindowSize(playWindow, &ww, &wh);
+                    ImGui::SetCurrentContext(playImguiCtx);
+                    ImGui_ImplOpenGL3_NewFrame();
+                    ImGui_ImplGlfw_NewFrame();
+                    ImGui::NewFrame();
+                    ImDrawList* dl = ImGui::GetForegroundDrawList();
+                    glm::mat4 vp = gProj * gView;
+                    auto project = [&](glm::vec3 wld, ImVec2& out) -> bool {
+                        glm::vec4 c = vp * glm::vec4(wld, 1.0f);
+                        if (c.w <= 1e-4f) return false;   // behind the camera
+                        out = ImVec2((c.x / c.w * 0.5f + 0.5f) * (float)ww,
+                                     (1.0f - (c.y / c.w * 0.5f + 0.5f)) * (float)wh);
+                        return true;
+                    };
+                    auto drawCapsule3D = [&](glm::vec3 base, float r, float total, ImU32 col) {
+                        r = std::max(r, 0.02f); total = std::max(total, 2.0f * r);
+                        float yBot = r, yTop = total - r;
+                        auto ring = [&](float cy) {
+                            ImVec2 prev; bool have = false;
+                            for (int i = 0; i <= 20; ++i) { float a = i / 20.0f * 6.2831853f; ImVec2 s;
+                                bool ok = project(base + glm::vec3(cosf(a) * r, cy, sinf(a) * r), s);
+                                if (ok && have) dl->AddLine(prev, s, col, 1.5f); prev = s; have = ok; }
+                        };
+                        auto arc = [&](glm::vec3 c, glm::vec3 u, glm::vec3 v) {
+                            ImVec2 prev; bool have = false;
+                            for (int i = 0; i <= 14; ++i) { float a = i / 14.0f * 3.14159265f; ImVec2 s;
+                                bool ok = project(c + u * (cosf(a) * r) + v * (sinf(a) * r), s);
+                                if (ok && have) dl->AddLine(prev, s, col, 1.5f); prev = s; have = ok; }
+                        };
+                        ring(yBot); ring(yTop);
+                        glm::vec3 cb = base + glm::vec3(0, yBot, 0), ct = base + glm::vec3(0, yTop, 0);
+                        arc(cb, glm::vec3(1,0,0), glm::vec3(0,-1,0)); arc(cb, glm::vec3(0,0,1), glm::vec3(0,-1,0));
+                        arc(ct, glm::vec3(1,0,0), glm::vec3(0, 1,0)); arc(ct, glm::vec3(0,0,1), glm::vec3(0, 1,0));
+                        const glm::vec3 card[4] = {{r,0,0},{-r,0,0},{0,0,r},{0,0,-r}};
+                        for (const glm::vec3& d : card) { ImVec2 a, b;
+                            if (project(base + glm::vec3(d.x, yBot, d.z), a) && project(base + glm::vec3(d.x, yTop, d.z), b))
+                                dl->AddLine(a, b, col, 1.5f); }
+                    };
+                    for (const NPCRuntime& n : npcRuntimes) {
+                        // Capsule collider, fitted to the NPC's bounds (matches the editor).
+                        if (n.sceneIndex >= 0 && n.sceneIndex < (int)scene.size()) {
+                            const SceneObject& so = scene[n.sceneIndex];
+                            glm::vec3 bmin(-0.5f), bmax(0.5f); glm::mat4 model = so.transform;
+                            if (so.skinnedId >= 0 && so.skinnedId < (int)skinnedLibrary.size()) {
+                                const SkinnedMesh& sm = skinnedLibrary[so.skinnedId];
+                                bmin = sm.bounds.min; bmax = sm.bounds.max; model = so.transform * sm.importFix;
+                            } else if (so.meshId >= 0 && so.meshId < (int)meshLibrary.size()) {
+                                bmin = meshLibrary[so.meshId].bounds.min; bmax = meshLibrary[so.meshId].bounds.max;
+                            }
+                            glm::vec3 mn(1e30f), mx(-1e30f);
+                            for (int c = 0; c < 8; ++c) {
+                                glm::vec3 cor((c&1)?bmax.x:bmin.x, (c&2)?bmax.y:bmin.y, (c&4)?bmax.z:bmin.z);
+                                glm::vec3 wp = glm::vec3(model * glm::vec4(cor, 1.0f));
+                                mn = glm::min(mn, wp); mx = glm::max(mx, wp);
+                            }
+                            float hgt = mx.y - mn.y;
+                            float rad = std::min(0.5f * std::max(mx.x - mn.x, mx.z - mn.z), 0.30f * hgt);
+                            glm::vec3 feet((mn.x + mx.x) * 0.5f, mn.y, (mn.z + mx.z) * 0.5f);
+                            drawCapsule3D(feet, rad, hgt, IM_COL32(120, 235, 140, 210));
+                        }
+                        // Path: a polyline through the remaining waypoints, draped on terrain.
+                        ImVec2 prev; bool havePrev = false;
+                        if (project(glm::vec3(n.pos.x, n.pos.y + 0.1f, n.pos.z), prev)) havePrev = true;
+                        for (size_t w = n.waypoint; w < n.path.size(); ++w) {
+                            float gy = terrain.enabled ? terrain.heightAt(n.path[w].x, n.path[w].y) : n.baseY;
+                            ImVec2 cur;
+                            if (project(glm::vec3(n.path[w].x, gy + 0.1f, n.path[w].y), cur)) {
+                                if (havePrev) dl->AddLine(prev, cur, IM_COL32(90, 220, 130, 200), 2.0f);
+                                prev = cur; havePrev = true;
+                            } else havePrev = false;
+                        }
+                        // Label above the head: name + state, then needs + goal.
+                        ImVec2 hp;
+                        if (!project(glm::vec3(n.pos.x, n.pos.y + 2.3f, n.pos.z), hp)) continue;
+                        const char* nm = (n.templateId >= 0 && n.templateId < (int)npcTemplates.size())
+                                             ? npcTemplates[n.templateId].name.c_str() : "NPC";
+                        char l1[128], l2[160];
+                        std::snprintf(l1, sizeof l1, "%s  [%s]", nm, npcStateName(n.state));
+                        std::snprintf(l2, sizeof l2, "HP %.0f  Hun %.0f  Thi %.0f  Ene %.0f%s%s",
+                                      n.health, n.hunger, n.thirst, n.energy,
+                                      n.targetName.empty() ? "" : "  -> ", n.targetName.c_str());
+                        ImVec2 s1 = ImGui::CalcTextSize(l1), s2 = ImGui::CalcTextSize(l2);
+                        float bw = std::max(s1.x, s2.x) + 8.0f, bh = s1.y + s2.y + 6.0f;
+                        ImVec2 tl(hp.x - bw * 0.5f, hp.y - bh);
+                        dl->AddRectFilled(tl, ImVec2(tl.x + bw, tl.y + bh), IM_COL32(0, 0, 0, 160), 3.0f);
+                        dl->AddText(ImVec2(tl.x + 4, tl.y + 3), IM_COL32(255, 255, 255, 255), l1);
+                        dl->AddText(ImVec2(tl.x + 4, tl.y + 3 + s1.y), IM_COL32(170, 225, 255, 255), l2);
+                    }
+                    ImGui::Render();
+                    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+                    ImGui::SetCurrentContext(editorCtx);
+                }
                 glfwSwapBuffers(playWindow);
             }
         }

@@ -39,4 +39,5 @@ bool drawViewportPanel(const char* name, RenderTarget& rt, const Camera& cam,
                        int selectedIndex, float gridSpacing,
                        const std::vector<SkinnedDrawItem>& skins = {},
                        EditContext* edit = nullptr,
-                       Terrain* terrain = nullptr, TerrainBrush* brush = nullptr);
+                       Terrain* terrain = nullptr, TerrainBrush* brush = nullptr,
+                       PlayerStart* playerStart = nullptr);   // selection index -2 = player start

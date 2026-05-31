@@ -506,7 +506,10 @@ void renderScene(GLuint fbo, int width, int height, const Camera& cam,
 
     // Textured ground plane (perspective only): a big camera-centered quad at
     // y=0, lit like the scene and fogged so its far edge melts into the horizon.
-    if (cam.type == Projection::Perspective && r.groundProgram && r.groundTex) {
+    // Only drawn as a *fallback* when there is no terrain — when a heightmap is
+    // present the terrain is the ground (no flat base plane underneath it).
+    if (cam.type == Projection::Perspective && r.groundProgram && r.groundTex
+        && r.terrainIndexCount <= 0) {
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
         glUseProgram(r.groundProgram);
         glUniformMatrix4fv(r.groundVPLoc, 1, GL_FALSE, glm::value_ptr(proj * view));

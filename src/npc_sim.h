@@ -9,12 +9,30 @@
 #include "navigation.h"
 #include "scene.h"
 #include "skinned.h"
+#include "terrain.h"
 
 // ---- Layer 3: scheduled NPC simulation -----------------------------------
-// Drives placed NPC instances (SceneObjects with npcTemplate >= 0) during play:
-// reads each NPC's daily schedule against the game clock, paths to the target
-// scene object via grid A*, walks there, depletes survival needs over game
-// time, and refills them on arrival. Mutates the scene objects' transforms.
+// Drives placed NPC instances (SceneObjects with npcTemplate >= 0) during play.
+//
+// The AI is a *priority-arbitrated state machine* (utility-lite): each decision
+// tick every state is scored from the NPC's needs, schedule and role, and the
+// NPC switches to the highest-scoring valid state. Transitions are emergent
+// (no hand-wired edges), so adding a state is purely additive. The chosen state
+// emits a goal; a shared locomotion layer paths to it via grid A*, walks, plays
+// the right animation, depletes needs, and refills them on arrival.
+
+// AI states. The set grows over time; roles will gate/weight which apply.
+// (Phase 1 = the Townsfolk baseline.)
+enum class NPCState {
+    Idle,     // stand still (fallback)
+    Wander,   // stroll to a random reachable point, pause, repeat
+    Work,     // go to the scheduled work location during work hours
+    Eat,      // go to a food location and restore hunger
+    Drink,    // go to a water location and restore thirst
+    Sleep,    // go to a bed/home location and restore energy
+    Goto,     // go to a scheduled location and wait there (generic appointment)
+};
+const char* npcStateName(NPCState s);
 
 // Live, per-instance state for one NPC while playing.
 struct NPCRuntime {
@@ -33,11 +51,19 @@ struct NPCRuntime {
     float     speed  = 1.5f;       // world units / second
     std::vector<glm::vec2> path;   // remaining world-XZ waypoints
     size_t    waypoint = 0;        // index of the next waypoint in `path`
-    // Schedule tracking.
-    std::string targetName;        // scene object we're currently heading to
-    std::string activity = "idle";
+    bool      moving = false;
+    // AI / behaviour state machine.
+    NPCState  state = NPCState::Idle;  // current behaviour
+    float     decideTimer = 0.0f;      // counts down to the next arbiter re-score
+    glm::vec2 goalXZ{0.0f};            // current navigation goal (world XZ)
+    bool      hasGoal = false;         // is goalXZ valid / are we pathing to it
+    float     pauseTimer = 0.0f;       // dwell time after reaching a wander point
+    unsigned  rng = 1u;                // per-NPC PRNG state (wander point picks)
+    int       consumingObj = -1;       // resource source we've taken a portion from this visit
+    // Schedule tracking / display.
+    std::string targetName;        // scene object we're currently heading to ("" = none)
+    std::string activity = "idle"; // current activity label (for the inspector)
     float       leadHours = 1.0f;  // depart this many game-hours early
-    bool        moving = false;
 };
 
 // Build a navigation grid from the scene. Every solid object that is NOT an NPC
@@ -63,4 +89,5 @@ void simulateNPCs(std::vector<NPCRuntime>& npcs,
                   const std::vector<NPCTemplate>& templates,
                   const NavGrid& grid,
                   const Environment& env,
+                  const Terrain& terrain,
                   float dt);

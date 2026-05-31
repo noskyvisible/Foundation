@@ -8,6 +8,10 @@
 #include <utility>
 #include <vector>
 
+// Consumable resource kind for a placed source object. Food/water sources are
+// what need-driven NPCs path to and consume from (each visit drains a portion).
+enum ResourceType { RES_NONE = 0, RES_FOOD = 1, RES_WATER = 2 };
+
 // A scene object: a named transform + colour (tint) + which mesh asset it uses.
 // npcTemplate >= 0 marks this object as a placed NPC instance of that template.
 struct SceneObject {
@@ -18,6 +22,8 @@ struct SceneObject {
     int skinnedId = -1;    // index into the skinned mesh library, or -1 if static
     int animClip  = 0;     // which animation clip to play (skinned objects only)
     int npcTemplate = -1;  // index into npcTemplates, or -1 if a plain object
+    int resourceType = RES_NONE;  // food/water source kind (RES_NONE = ordinary prop)
+    int portions = 0;             // servings remaining (resource sources only)
 };
 
 // ---- NPC definition (template) -------------------------------------------
@@ -57,18 +63,45 @@ struct NPCTemplate {
     std::vector<ScheduleEntry> schedule;
 };
 
-// Plain-text scene format (v3). Header + two library manifests (the source
-// paths backing the static & skinned mesh libraries) + per-object records
-// (name, 16-float transform, RGB colour, and the meshId/skinnedId/animClip/
-// npcTemplate references). Saving captures the libraries so that loading can
-// re-import the meshes and restore each object's references. Older v2 files
-// (transform + colour only) still load. NPC templates themselves are not yet
-// persisted, so npcTemplate indices are only meaningful within one session.
+// Where the FPS player spawns, plus the controller's tuning. Edited in the
+// Properties panel, shown as a marker in the editor, and used by play mode's
+// first-person controller. Persisted with the scene.
+struct PlayerStart {
+    glm::vec3 pos{0.0f, 0.0f, 0.0f};  // spawn position (feet, world space)
+    float yaw       = 0.0f;           // spawn facing (radians)
+    float eyeHeight = 1.7f;           // camera height above the feet
+    float radius    = 0.4f;           // capsule radius (marker; collision is ground-only)
+    float walkSpeed = 5.0f;           // m/s
+    float runSpeed  = 9.0f;           // m/s while holding Shift
+    float jumpSpeed = 6.0f;           // m/s launch velocity
+    float gravity   = 18.0f;          // m/s^2
+    float mouseSens = 0.0025f;        // radians per pixel
+    bool  fps       = true;           // play uses the FPS controller (else free-fly)
+};
+
+struct Environment;   // environment.h (passed by ref; full include in scene.cpp)
+struct Terrain;       // terrain.h
+
+// Plain-text scene format (v4): header + library manifests (source paths for the
+// static & skinned mesh libraries) + per-object records + NPC templates +
+// environment/weather/fog. The heightmap terrain is written to a binary sidecar
+// next to the scene file ("<path>.terrain"). Saving captures everything needed to
+// fully restore the world; loading re-imports the meshes and restores the rest.
+// Older files still load: v2 (transforms + colour only) and v3 (adds library
+// manifests + object refs). Missing v4 sections fall back to the caller's state.
 bool saveScene(const std::vector<SceneObject>& scene,
                const std::vector<MeshAsset>& meshLib,
                const std::vector<SkinnedMesh>& skinnedLib,
+               const std::vector<NPCTemplate>& npcTemplates,
+               const Environment& env,
+               const Terrain& terrain,
+               const PlayerStart& player,
                const char* path);
 bool loadScene(std::vector<SceneObject>& outScene,
                std::vector<MeshAsset>& meshLib,
                std::vector<SkinnedMesh>& skinnedLib,
+               std::vector<NPCTemplate>& npcTemplates,
+               Environment& env,
+               Terrain& terrain,
+               PlayerStart& player,
                const char* path);
