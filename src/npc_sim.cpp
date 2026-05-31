@@ -111,8 +111,9 @@ void buildNavFromScene(NavGrid& grid,
         NavRect fp = worldFootprint(m, bmin, bmax);
         worldMin = glm::min(worldMin, fp.min);
         worldMax = glm::max(worldMax, fp.max);
-        if (o.npcTemplate >= 0) continue;     // NPCs aren't obstacles
-        if (isDest(o.name))      continue;     // destinations aren't obstacles
+        if (o.npcTemplate >= 0)           continue;   // NPCs aren't obstacles
+        if (isDest(o.name))               continue;   // schedule destinations aren't obstacles
+        if (o.resourceType != RES_NONE)   continue;   // food/water/bed are walkable goals
         obstacles.push_back(fp);
     }
 
@@ -228,7 +229,8 @@ static std::string schedLocFor(const NPCTemplate& t, const char* k1, const char*
 // scheduled work hours when no need is pressing. Transitions are emergent: the
 // NPC simply ends up in whichever state scores highest right now.
 static StateChoice decideTownsfolk(const NPCRuntime& n, const NPCTemplate& t, float now,
-                                   const std::string& foodLoc, const std::string& waterLoc) {
+                                   const std::string& foodLoc, const std::string& waterLoc,
+                                   const std::string& bedLoc) {
     bool night = (now < 6.0f || now >= 21.0f);
     const ScheduleEntry* g = pickGoal(t, now, n.leadHours);
     std::string sa = g ? toLower(g->activity) : std::string();
@@ -251,26 +253,39 @@ static StateChoice decideTownsfolk(const NPCRuntime& n, const NPCTemplate& t, fl
     //     short lead window, so the NPC stays put until ~15 min before, then heads
     //     over. The activity keyword picks the matching state (so Eat/Sleep/Drink
     //     still restore their need); anything else is a generic Goto-and-wait.
-    if (g && !g->location.empty()) {
-        NPCState st = NPCState::Goto;
-        if      (saHas("sleep") || saHas("bed") || saHas("rest")) st = NPCState::Sleep;
-        else if (saHas("eat")   || saHas("food") || saHas("cook")) st = NPCState::Eat;
-        else if (saHas("drink") || saHas("water"))                st = NPCState::Drink;
-        else if (saHas("work"))                                   st = NPCState::Work;
-        consider(st, g->location, 0.45f);
+    //     Duty is HIGH priority (0.75): a shopkeeper/barman sticks to their shift —
+    //     only a *critical* need (urgency > 0.75, i.e. below ~15) pulls them away,
+    //     and they head back the moment it's handled.
+    bool hasAppt = (g && !g->location.empty());
+    NPCState apptState = NPCState::Goto;
+    if (hasAppt) {
+        if      (saHas("sleep") || saHas("bed") || saHas("rest")) apptState = NPCState::Sleep;
+        else if (saHas("eat")   || saHas("food") || saHas("cook")) apptState = NPCState::Eat;
+        else if (saHas("drink") || saHas("water"))                apptState = NPCState::Drink;
+        else if (saHas("work"))                                   apptState = NPCState::Work;
+        consider(apptState, g->location, 0.75f);
     }
+    // A non-sleep appointment (a work/duty shift) outranks sleeping entirely: the
+    // NPC reports for the shift even mid-sleep, getting up ~15 min before it opens.
+    bool dutyCalls = hasAppt && apptState != NPCState::Sleep;
 
-    // (B) Survival needs escalate and override the schedule when they get urgent
-    //     (emergent "leave work to eat/sleep"). Eat/Drink head for the nearest
-    //     food/water *source* if one exists, else a matching schedule location.
-    //     A "sticky" bonus keeps the NPC finishing a meal/drink/rest once started
-    //     (until ~85%) so it tops the need up instead of nibbling. Night nudges
-    //     sleep up a little.
+    // (B) Survival needs. Below ~15 a need becomes urgent enough (urgency > 0.75)
+    //     to override even a work shift; above that, duty wins. Once a restorative
+    //     action is under way the "sticky" bonus (0.85) keeps the NPC finishing it
+    //     to ~85% — beating the shift — so it tops up instead of bouncing back to
+    //     work half-done, then returns. The ambient night-sleep nudge applies only
+    //     when off-duty (no appointment).
     float eu = needUrgency(n.energy), hu = needUrgency(n.hunger), tu = needUrgency(n.thirst);
-    auto sticky = [&](NPCState st, float need) { return (n.state == st && need < 85.0f) ? 0.60f : 0.0f; };
+    auto sticky = [&](NPCState st, float need) { return (n.state == st && need < 85.0f) ? 0.85f : 0.0f; };
 
-    consider(NPCState::Sleep, schedLocFor(t, "sleep", "bed"),
-             std::max(eu + (night ? 0.30f : 0.0f), sticky(NPCState::Sleep, n.energy)));
+    float sleepScore;
+    if (dutyCalls) {
+        sleepScore = 0.0f;   // a work shift is imminent/active: get up and go, even mid-sleep
+    } else {
+        sleepScore = std::max(eu + ((night && !hasAppt) ? 0.30f : 0.0f), sticky(NPCState::Sleep, n.energy));
+        if (n.sleepTimer > 0.0f) sleepScore = 2.0f;   // otherwise run the full random sleep session
+    }
+    consider(NPCState::Sleep, !bedLoc.empty() ? bedLoc : schedLocFor(t, "sleep", "bed"), sleepScore);
     consider(NPCState::Eat,   !foodLoc.empty()  ? foodLoc  : schedLocFor(t, "eat", "food"),
              std::max(hu, sticky(NPCState::Eat, n.hunger)));
     consider(NPCState::Drink, !waterLoc.empty() ? waterLoc : schedLocFor(t, "drink", "water"),
@@ -320,17 +335,18 @@ void simulateNPCs(std::vector<NPCRuntime>& npcs,
         if (n.templateId < 0 || n.templateId >= (int)templates.size()) continue;
         const NPCTemplate& t = templates[n.templateId];
 
-        // Nearest food/water source with portions left (so a no-schedule NPC can
-        // still find somewhere to eat/drink). Scanned each frame against the live
-        // scene so depleted sources drop out immediately.
-        std::string foodLoc, waterLoc;
-        float bestF = 1e30f, bestW = 1e30f;
+        // Nearest food/water/bed source (so a no-schedule NPC can still find where
+        // to eat/drink/sleep). Scanned each frame against the live scene so depleted
+        // food/water drop out immediately; beds are reusable and never deplete.
+        std::string foodLoc, waterLoc, bedLoc;
+        float bestF = 1e30f, bestW = 1e30f, bestB = 1e30f;
         for (const SceneObject& so : scene) {
-            if (so.portions <= 0) continue;
+            if (so.resourceType == RES_NONE) continue;
             glm::vec3 sp = glm::vec3(so.transform[3]);
             float d2 = (sp.x - n.pos.x) * (sp.x - n.pos.x) + (sp.z - n.pos.z) * (sp.z - n.pos.z);
-            if (so.resourceType == RES_FOOD  && d2 < bestF) { bestF = d2; foodLoc  = so.name; }
-            if (so.resourceType == RES_WATER && d2 < bestW) { bestW = d2; waterLoc = so.name; }
+            if (so.resourceType == RES_FOOD  && so.portions > 0 && d2 < bestF) { bestF = d2; foodLoc  = so.name; }
+            if (so.resourceType == RES_WATER && so.portions > 0 && d2 < bestW) { bestW = d2; waterLoc = so.name; }
+            if (so.resourceType == RES_BED   && d2 < bestB)                    { bestB = d2; bedLoc   = so.name; }
         }
 
         // 1) DECIDE: re-score the states on a throttle and adopt the winner.
@@ -338,7 +354,7 @@ void simulateNPCs(std::vector<NPCRuntime>& npcs,
         n.decideTimer -= dt;
         if (n.decideTimer <= 0.0f) {
             n.decideTimer = 0.4f;
-            StateChoice c = decideTownsfolk(n, t, now, foodLoc, waterLoc);
+            StateChoice c = decideTownsfolk(n, t, now, foodLoc, waterLoc, bedLoc);
             if (c.state != n.state) {
                 n.state      = c.state;
                 n.hasGoal    = false;       // new state wants a fresh goal
@@ -390,14 +406,31 @@ void simulateNPCs(std::vector<NPCRuntime>& npcs,
 
         // 4) Needs deplete over game time; the current state restores its need
         //    once the NPC has arrived at (and is standing on) its goal.
-        n.hunger -= t.attr.hungerRate * gameHours;
-        n.thirst -= t.attr.thirstRate * gameHours;
-        n.energy -= t.attr.energyRate * gameHours;
         bool arrivedAtGoal = !n.moving && n.hasGoal;
+        bool asleep = (n.state == NPCState::Sleep && arrivedAtGoal);
+        if (n.state != NPCState::Sleep) n.sleepTimer = 0.0f;   // sleep interrupted -> drop the session
+
+        // Rate multipliers: needs barely move while asleep; energy doesn't drain
+        // while asleep and drains at half-rate during the post-sleep "rested" window
+        // (so they don't nod off again every few hours).
+        float needMul   = asleep ? 0.15f : 1.0f;
+        float energyMul = asleep ? 0.0f  : (n.restedTimer > 0.0f ? 0.5f : 1.0f);
+        n.hunger -= t.attr.hungerRate * gameHours * needMul;
+        n.thirst -= t.attr.thirstRate * gameHours * needMul;
+        n.energy -= t.attr.energyRate * gameHours * energyMul;
+        if (n.restedTimer > 0.0f && !asleep) n.restedTimer = std::max(0.0f, n.restedTimer - gameHours);
+
         if (arrivedAtGoal) {
             const float refill = 40.0f * gameHours;   // per game-hour
             if (n.state == NPCState::Sleep) {
-                n.energy += refill;                   // resting anywhere restores energy
+                if (n.sleepTimer <= 0.0f)             // begin a sleep session of random length
+                    n.sleepTimer = 5.0f + frand(n.rng) * 4.0f;        // 5..9 game-hours
+                n.energy += refill;                                   // restore energy while asleep
+                n.sleepTimer -= gameHours;
+                if (n.sleepTimer <= 0.0f) {           // wake rested: energy drains slower for a while
+                    n.sleepTimer  = 0.0f;
+                    n.restedTimer = 8.0f + frand(n.rng) * 4.0f;       // 8..12 game-hours
+                }
             } else if (n.state == NPCState::Eat || n.state == NPCState::Drink) {
                 int ri = findObjectByName(scene, n.targetName);
                 int want = (n.state == NPCState::Eat) ? RES_FOOD : RES_WATER;

@@ -444,11 +444,14 @@ int main() {
     auto doAddResource = [&](int type) {
         snapshot();
         SceneObject o;
-        o.name = (type == RES_WATER ? "Water " : "Food ") + std::to_string(scene.size());
+        const char* pre = (type == RES_WATER) ? "Water " : (type == RES_BED) ? "Bed " : "Food ";
+        o.name = pre + std::to_string(scene.size());
         o.transform = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, groundY(0.0f, 0.0f), 0.0f));
-        o.color = (type == RES_WATER) ? glm::vec3(0.35f, 0.55f, 0.95f) : glm::vec3(0.85f, 0.6f, 0.3f);
+        o.color = (type == RES_WATER) ? glm::vec3(0.35f, 0.55f, 0.95f)
+                : (type == RES_BED)   ? glm::vec3(0.60f, 0.45f, 0.85f)
+                                      : glm::vec3(0.85f, 0.60f, 0.30f);
         o.resourceType = type;
-        o.portions = 10;
+        o.portions = (type == RES_BED) ? 0 : 10;   // beds are reusable (no portions)
         scene.push_back(o);
         selected = (int)scene.size() - 1;
     };
@@ -779,6 +782,7 @@ int main() {
             if (ImGui::Selectable("Cube"))         doAddCube();
             if (ImGui::Selectable("Food source"))  doAddResource(RES_FOOD);
             if (ImGui::Selectable("Water source")) doAddResource(RES_WATER);
+            if (ImGui::Selectable("Bed"))          doAddResource(RES_BED);
             ImGui::EndPopup();
         }
         ImGui::SameLine();
@@ -980,16 +984,19 @@ int main() {
                 }
             }
 
-            // Resource source: food/water that need-driven NPCs consume from.
+            // Resource source: food/water (consumed) or a bed (reusable) that
+            // need-driven NPCs path to.
             if (o.npcTemplate < 0 && o.skinnedId < 0) {
                 ImGui::SeparatorText("Resource");
-                const char* kinds[] = { "None (prop)", "Food", "Water" };
+                const char* kinds[] = { "None (prop)", "Food", "Water", "Bed" };
                 int rt = o.resourceType;
-                if (ImGui::Combo("Type", &rt, kinds, 3)) { o.resourceType = rt; propActivated = true; }
-                if (o.resourceType != RES_NONE) {
+                if (ImGui::Combo("Type", &rt, kinds, 4)) { o.resourceType = rt; propActivated = true; }
+                if (o.resourceType == RES_FOOD || o.resourceType == RES_WATER) {
                     ImGui::DragInt("Portions", &o.portions, 0.2f, 0, 9999);
                     propActivated |= ImGui::IsItemActivated();
                     ImGui::TextDisabled("Each visit by a hungry/thirsty NPC drains one portion.");
+                } else if (o.resourceType == RES_BED) {
+                    ImGui::TextDisabled("A bed restores a tired NPC's energy; reusable (no portions).");
                 }
             }
 

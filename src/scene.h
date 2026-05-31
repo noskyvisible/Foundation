@@ -8,9 +8,10 @@
 #include <utility>
 #include <vector>
 
-// Consumable resource kind for a placed source object. Food/water sources are
-// what need-driven NPCs path to and consume from (each visit drains a portion).
-enum ResourceType { RES_NONE = 0, RES_FOOD = 1, RES_WATER = 2 };
+// Resource kind for a placed source object. Need-driven NPCs path to these:
+// food/water are consumed (each visit drains a portion); a bed is reusable
+// (restores energy, never depletes).
+enum ResourceType { RES_NONE = 0, RES_FOOD = 1, RES_WATER = 2, RES_BED = 3 };
 
 // A scene object: a named transform + colour (tint) + which mesh asset it uses.
 // npcTemplate >= 0 marks this object as a placed NPC instance of that template.

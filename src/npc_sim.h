@@ -60,6 +60,8 @@ struct NPCRuntime {
     float     pauseTimer = 0.0f;       // dwell time after reaching a wander point
     unsigned  rng = 1u;                // per-NPC PRNG state (wander point picks)
     int       consumingObj = -1;       // resource source we've taken a portion from this visit
+    float     sleepTimer = 0.0f;       // remaining game-hours of the current sleep session (>0 = asleep)
+    float     restedTimer = 0.0f;      // remaining game-hours of the post-sleep slow-drain "rested" buff
     // Schedule tracking / display.
     std::string targetName;        // scene object we're currently heading to ("" = none)
     std::string activity = "idle"; // current activity label (for the inspector)
