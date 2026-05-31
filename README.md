@@ -1,10 +1,11 @@
 # Foundation
 
 A from-scratch **C++/OpenGL game engine** with a Hammer/Unity-style editor:
-quad-view editing and a separate play window, transform gizmos, model and
-skeletal-animation import, scripted NPCs with pathfinding, a dynamic day/night
-sky with weather, and a sculptable heightmap terrain — all built on a GL 3.3
-core renderer with no engine middleware.
+quad-view editing and a separate play window with a first-person controller,
+transform gizmos, model and skeletal-animation import, **needs-driven NPCs** with
+a state-machine AI and pathfinding, a dynamic day/night sky with weather, and a
+sculptable heightmap terrain — all built on a GL 3.3 core renderer with no
+engine middleware.
 
 ## Download & run (Windows)
 
@@ -26,7 +27,8 @@ instead, see [Building](#building-windows--mingw).
 - **Quad-view** — Perspective + Top/Front/Side orthographic viewports, each
   rendered to its own framebuffer; maximize one (Space) or show the 2×2 grid.
 - **Play mode** — `F5` opens a separate, fullscreen-able (`F11`) game window with
-  its own GL context and a free-fly game camera; the editor keeps running.
+  its own GL context and a **first-person controller** (or a free-fly camera);
+  the editor keeps running. **Tab** overlays live NPC debug info.
 - **Gizmos** (ImGuizmo) — translate / rotate / scale (`W`/`E`/`R`), world/local,
   click-to-select via ray picking, an orange selection box.
 - **Snap to grid** with an adjustable grid size (drives the grid *and* the snap).
@@ -42,11 +44,24 @@ instead, see [Building](#building-windows--mingw).
 - **Skinned meshes** — GPU skinning with a per-frame bone palette; **skeletal
   animation** clips selected by movement state (idle / walk / run).
 
-### NPCs & navigation
+### NPCs, AI & navigation
 - **NPC templates** — attributes and needs (health/hunger/thirst/energy with
   per-hour rates), plus a daily **schedule** (HH:MM → activity → location).
-- **Grid A\*** pathfinding; in play mode NPCs walk/run to their scheduled targets
-  on the game clock, with the animation clip driven by their speed.
+- **State-machine AI** — a priority-arbitrated set of behaviours (idle, wander,
+  go-to, work, eat, drink, sleep) re-scored each tick from the NPC's needs and
+  schedule. Transitions are emergent (no hand-wired edges), so new states are
+  cheap to add. NPCs wait in place and set off only shortly before a scheduled
+  appointment, rather than leaving hours early.
+- **Survival needs** — needs deplete on the game clock; **food & water sources**
+  placed in the world (each with a mesh + portion count) let hungry/thirsty NPCs
+  path to the nearest source, consume a portion per visit, and top the need up
+  (depleted sources stop feeding).
+- **Grid A\*** pathfinding; NPCs walk/run **on the terrain** to their goals, with
+  the animation clip driven by their speed.
+- **First-person play** — a player controller (WASD + sprint + jump, gravity,
+  terrain collision) spawns from an editable, gizmo-movable **Player Start**;
+  **capsule collider** gizmos are drawn for the player and every NPC (in the
+  editor and the in-play debug overlay).
 
 ### Environment & sky
 - **Game clock** with an adjustable day length and a full day/night cycle.
@@ -113,11 +128,14 @@ cmake --build build
 | Copy / Paste | `Ctrl+C` / `Ctrl+V` |
 | Save scene | `Ctrl+S` |
 | Play / Stop | `F5` (in play window: `F11` fullscreen, `Esc` stop) |
+| Move in play (first-person) | `WASD`, `Shift` sprint, `Space` jump, mouse to look |
+| NPC debug overlay (in play) | `Tab` — stats, AI state, A\* path, capsule |
 
 Panels: **Outliner** (objects), **Controls / Environment / Terrain** (tabbed —
 gizmo & grid, sky/weather/fog, terrain brushes), **Properties** and **NPC
-Editor**. Import models with **Load Mesh** in the Outliner; put source models in
-`models/` and textures in `materials/`.
+Editor**. The Outliner's **Add** dropdown places cubes and food/water sources;
+**Load Mesh** imports models. Put source models in `models/` and textures in
+`materials/`. Select the player start or an NPC to edit it in **Properties**.
 
 ## Layout
 
@@ -127,7 +145,7 @@ src/
   camera / environment    view + projection; game clock, day/night, lighting
   weather / terrain       weather state machine; heightmap + sculpt + splat
   mesh / skinned / scene  static + skinned model loading; scene model + save/load
-  navigation / npc_sim    grid A* pathfinding; scheduled NPC simulation
+  navigation / npc_sim    grid A* pathfinding; NPC state-machine AI (needs, schedule, food/water)
   renderer / shaders      GL 3.3 renderer; sky/cloud/rain/terrain/fog shaders
   editor                  dockable viewport panel (gizmos, picking, brushes)
   platform_file / stb_impl native file dialog; stb_image implementation
